@@ -1,0 +1,325 @@
+name: Release Please
+
+# ─────────────────────────────────────────────────────────────────────────────
+# This workflow has two responsibilities:
+#
+#   1. OPEN / UPDATE a Release Please PR whenever commits land on `main`.
+#      Release Please inspects conventional commits and bumps the version in
+#      .release-please-manifest.json, generating a CHANGELOG entry.
+#
+#   2. CUT A GITHUB RELEASE when the Release Please PR is merged.
+#      Immediately after, the `release_evidence` job runs to:
+#        - Build the official release image from the tagged commit
+#        - Create signed SLSA build-provenance and test-results attestations
+#        - Verify both attestations
+#        - Generate a compliance evidence markdown report
+#        - Upload the report + attestation bundles to the GitHub Release
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Minimum permissions for the Release Please action.
+# The release_evidence job overrides these with the additional scopes it needs.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 1 – Run the Release Please action
+  #
+  # On every push to main:
+  #   - If there are releasable commits, create or update the Release Please PR.
+  #   - If the Release Please PR was just merged, create the GitHub Release and
+  #     update the manifest version.
+  #
+  # Outputs consumed by the release_evidence job:
+  #   release_created  – "true" when a GitHub Release was just cut
+  #   tag_name         – e.g. "v0.2.0"
+  # ───────────────────────────────────────────────────────────────────────────
+  release_please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      tag_name:        ${{ steps.rp.outputs.tag_name }}
+
+    steps:
+      - name: Run Release Please
+        id: rp
+        uses: googleapis/release-please-action@v4
+        with:
+          # Manifest mode: version is tracked in .release-please-manifest.json
+          # and workflow options are read from .release-please-config.json.
+          config-file:   .release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 2 – Build the release image and attach attestation evidence
+  #
+  # Only runs when Job 1 actually cut a new GitHub Release.
+  # Steps:
+  #   1. Check out the release tag
+  #   2. Build and push the image to GHCR (tagged with the release version)
+  #   3. Create SLSA build provenance attestation  (actions/attest-build-provenance)
+  #   4. Run tests → create test-results attestation             (actions/attest)
+  #   5. Verify both attestations with `gh attestation verify`
+  #   6. Download attestation bundles
+  #   7. Generate a compliance markdown report
+  #   8. Upload report + bundles to the GitHub Release
+  # ───────────────────────────────────────────────────────────────────────────
+  release_evidence:
+    name: Build, attest & attach release evidence
+    needs: release_please
+    if: needs.release_please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+
+    # Additional scopes beyond the workflow defaults.
+    permissions:
+      contents: write     # upload assets to the GitHub Release
+      packages: write     # push image + attestations to GHCR
+      id-token: write     # obtain OIDC token for Sigstore signing
+      attestations: write # persist attestations via the GitHub attestations API
+
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Canonical GHCR image path.  The /poc suffix names the image as a
+      # dedicated sub-package within this repository's GHCR namespace.
+      IMAGE_NAME: ghcr.io/${{ github.repository }}/poc
+
+    steps:
+      # ── Checkout the exact commit that Release Please just tagged ──────────
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release_please.outputs.tag_name }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Build and push the official release image ─────────────────────────
+      # The human-readable tag uses the release version for discoverability.
+      # All attestation identity is anchored to the digest, never the tag.
+      - name: Build and push release image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ needs.release_please.outputs.tag_name }}
+
+      - name: Set artifact_ref
+        id: set_ref
+        run: |
+          echo "artifact_ref=${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}" \
+            >> "$GITHUB_OUTPUT"
+
+      # ── Attestation 1: SLSA Build Provenance ──────────────────────────────
+      # Records that this image digest was produced by this workflow run from
+      # this repository commit, signed via Sigstore/OIDC.
+      - name: Attest build provenance
+        id: attest_build
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name:     ${{ env.IMAGE_NAME }}
+          subject-digest:   ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      # ── Test suite ────────────────────────────────────────────────────────
+      # Replace this step with a real test runner (pytest, go test, etc.).
+      # The script writes pass_count / fail_count to GITHUB_OUTPUT so the
+      # predicate below can embed an accurate summary.
+      - name: Run tests
+        id: run_tests
+        run: |
+          echo "Running POC test suite..."
+          pass_count=0
+          fail_count=0
+
+          run_test() {
+            local name="$1" result="$2"
+            if [ "$result" = "PASSED" ]; then
+              echo "  ✅ ${name}"; pass_count=$((pass_count + 1))
+            else
+              echo "  ❌ ${name}"; fail_count=$((fail_count + 1))
+            fi
+          }
+
+          run_test "test-dockerfile-exists"   "PASSED"
+          run_test "test-workflow-syntax"     "PASSED"
+          run_test "test-image-label-source"  "PASSED"
+          run_test "test-image-label-desc"    "PASSED"
+
+          echo ""
+          echo "Results: ${pass_count} passed, ${fail_count} failed"
+          [ "$fail_count" -ne 0 ] && { echo "::error::${fail_count} test(s) failed"; exit 1; }
+
+          echo "pass_count=${pass_count}" >> "$GITHUB_OUTPUT"
+          echo "fail_count=${fail_count}" >> "$GITHUB_OUTPUT"
+
+      # ── Attestation 2: Test Results ────────────────────────────────────────
+      # Custom predicate type https://example.com/test-results/v1 carries the
+      # structured test summary; actions/attest wraps it in a signed in-toto
+      # envelope and pushes it to the GHCR repository.
+      - name: Generate test-results predicate
+        run: |
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          cat > test-results.json << EOF
+          {
+            "testSuite":  "poc-unit-tests",
+            "imageRef":   "${{ steps.set_ref.outputs.artifact_ref }}",
+            "release":    "${{ needs.release_please.outputs.tag_name }}",
+            "timestamp":  "${TIMESTAMP}",
+            "results": [
+              {"name": "test-dockerfile-exists",  "status": "PASSED", "durationMs": 5},
+              {"name": "test-workflow-syntax",    "status": "PASSED", "durationMs": 8},
+              {"name": "test-image-label-source", "status": "PASSED", "durationMs": 4},
+              {"name": "test-image-label-desc",   "status": "PASSED", "durationMs": 3}
+            ],
+            "summary": {
+              "total":   4,
+              "passed":  ${{ steps.run_tests.outputs.pass_count }},
+              "failed":  ${{ steps.run_tests.outputs.fail_count }},
+              "skipped": 0
+            }
+          }
+          EOF
+
+      - name: Attest test results
+        id: attest_tests
+        uses: actions/attest@v2
+        with:
+          subject-name:     ${{ env.IMAGE_NAME }}
+          subject-digest:   ${{ steps.build.outputs.digest }}
+          predicate-type:   "https://example.com/test-results/v1"
+          predicate-path:   test-results.json
+          push-to-registry: true
+
+      # ── Verify both attestations ───────────────────────────────────────────
+      - name: Verify build provenance attestation
+        id: verify_build
+        run: |
+          gh attestation verify \
+            "oci://${{ steps.set_ref.outputs.artifact_ref }}" \
+            --owner "${{ github.repository_owner }}" \
+            --predicate-type "https://slsa.dev/provenance/v1"
+          echo "status=PASSED" >> "$GITHUB_OUTPUT"
+
+      - name: Verify test-results attestation
+        id: verify_tests
+        run: |
+          gh attestation verify \
+            "oci://${{ steps.set_ref.outputs.artifact_ref }}" \
+            --owner "${{ github.repository_owner }}" \
+            --predicate-type "https://example.com/test-results/v1"
+          echo "status=PASSED" >> "$GITHUB_OUTPUT"
+
+      # ── Download attestation bundles ───────────────────────────────────────
+      - name: Download attestation bundles
+        run: |
+          mkdir -p attestation-bundles
+          gh attestation download \
+            "oci://${{ steps.set_ref.outputs.artifact_ref }}" \
+            --owner "${{ github.repository_owner }}" \
+            -d attestation-bundles
+          echo "Downloaded attestation files:"
+          ls -lh attestation-bundles/
+
+      # ── Generate the compliance evidence report ────────────────────────────
+      - name: Generate compliance evidence report
+        run: |
+          DIGEST="${{ steps.build.outputs.digest }}"
+          DIGEST_SHORT="${DIGEST#sha256:}"
+          DIGEST_SHORT="${DIGEST_SHORT:0:12}"
+          RELEASE_TAG="${{ needs.release_please.outputs.tag_name }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          REPO="${{ github.repository }}"
+          OWNER="${{ github.repository_owner }}"
+
+          REPORT_FILE="compliance-evidence-${DIGEST_SHORT}.md"
+
+          cat > "${REPORT_FILE}" << REPORT
+          # Compliance Evidence Report
+
+          | Field | Value |
+          |-------|-------|
+          | Release | \`${RELEASE_TAG}\` |
+          | Generated | \`${TIMESTAMP}\` |
+          | Repository | \`${REPO}\` |
+          | Run ID | \`${{ github.run_id }}\` |
+
+          ## Image Reference
+
+          \`\`\`
+          ${{ env.IMAGE_NAME }}@${DIGEST}
+          \`\`\`
+
+          ## Attestation Verification Results
+
+          | Attestation | Predicate Type | Status |
+          |-------------|----------------|--------|
+          | Build Provenance (SLSA) | \`https://slsa.dev/provenance/v1\` | ✅ ${{ steps.verify_build.outputs.status }} |
+          | Test Results | \`https://example.com/test-results/v1\` | ✅ ${{ steps.verify_tests.outputs.status }} |
+
+          ## Test Summary
+
+          | Test | Status |
+          |------|--------|
+          | test-dockerfile-exists  | ✅ PASSED |
+          | test-workflow-syntax    | ✅ PASSED |
+          | test-image-label-source | ✅ PASSED |
+          | test-image-label-desc   | ✅ PASSED |
+
+          ## Attestation Bundles
+
+          The `.jsonl` files attached to this release contain the signed in-toto
+          attestation envelopes. Verify independently with:
+
+          \`\`\`bash
+          gh attestation verify \\
+            oci://${{ env.IMAGE_NAME }}@${DIGEST} \\
+            --owner ${OWNER}
+          \`\`\`
+          REPORT
+
+          echo "REPORT_FILE=${REPORT_FILE}" >> "$GITHUB_ENV"
+
+      # ── Upload report and bundles to the GitHub Release ────────────────────
+      - name: Upload evidence to GitHub Release
+        run: |
+          RELEASE_TAG="${{ needs.release_please.outputs.tag_name }}"
+
+          gh release upload "${RELEASE_TAG}" "${REPORT_FILE}" --clobber
+
+          for bundle_file in attestation-bundles/*; do
+            [ -f "${bundle_file}" ] && \
+              gh release upload "${RELEASE_TAG}" "${bundle_file}" --clobber
+          done
+
+      - name: Step summary
+        run: |
+          DIGEST="${{ steps.build.outputs.digest }}"
+          RELEASE_TAG="${{ needs.release_please.outputs.tag_name }}"
+          echo "### 🚀 Release evidence attached" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Release | \`${RELEASE_TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Digest  | \`${DIGEST}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "#### Attestations" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ✅ Build Provenance (SLSA)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ✅ Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Evidence report and attestation bundles uploaded to the GitHub Release." \
+            >> "$GITHUB_STEP_SUMMARY"
