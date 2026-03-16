@@ -10,10 +10,21 @@ name: Release Please
 #   2. CUT A GITHUB RELEASE when the Release Please PR is merged.
 #      Immediately after, the `release_evidence` job runs to:
 #        - Build the official release image from the tagged commit
-#        - Create signed SLSA build-provenance and test-results attestations
-#        - Verify both attestations
+#        - Create a signed SLSA build-provenance attestation for the release
+#          image (the release image has a different digest from the RC, so it
+#          needs its own provenance; test-results and PR CI summary
+#          attestations are NOT repeated here because they were already
+#          created on the RC image during the Release Please PR lifecycle –
+#          see rc-attest-on-release-please-pr.yml)
+#        - Verify the build provenance attestation
+#        - Download attestation bundles
 #        - Generate a compliance evidence markdown report
 #        - Upload the report + attestation bundles to the GitHub Release
+#
+# NOTE: A Personal Access Token (PAT) is passed to Release Please via the
+# RELEASE_PLEASE_TOKEN secret.  The default GITHUB_TOKEN would prevent
+# workflows (e.g. rc-attest-on-release-please-pr.yml) from triggering on
+# the Release Please PR.
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -52,6 +63,11 @@ jobs:
         id: rp
         uses: googleapis/release-please-action@v4
         with:
+          # A PAT is required so that the Release Please PR triggers
+          # downstream workflows (e.g. rc-attest-on-release-please-pr.yml).
+          # The default GITHUB_TOKEN intentionally does not trigger further
+          # workflow runs to prevent recursive loops.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           # Manifest mode: version is tracked in .release-please-manifest.json
           # and workflow options are read from .release-please-config.json.
           config-file:   .release-please-config.json
@@ -61,15 +77,22 @@ jobs:
   # Job 2 – Build the release image and attach attestation evidence
   #
   # Only runs when Job 1 actually cut a new GitHub Release.
+  #
+  # The RC workflow (rc-attest-on-release-please-pr.yml) already created
+  # test-results and PR CI summary attestations for the release candidate.
+  # This job does NOT repeat those.  It only creates a SLSA build-provenance
+  # attestation for the *release* image, because the release image is built
+  # fresh from the tagged commit and therefore has a different digest than
+  # the RC image.
+  #
   # Steps:
   #   1. Check out the release tag
   #   2. Build and push the image to GHCR (tagged with the release version)
   #   3. Create SLSA build provenance attestation  (actions/attest-build-provenance)
-  #   4. Run tests → create test-results attestation             (actions/attest)
-  #   5. Verify both attestations with `gh attestation verify`
-  #   6. Download attestation bundles
-  #   7. Generate a compliance markdown report
-  #   8. Upload report + bundles to the GitHub Release
+  #   4. Verify the build provenance attestation with `gh attestation verify`
+  #   5. Download attestation bundles
+  #   6. Generate a compliance markdown report
+  #   7. Upload report + bundles to the GitHub Release
   # ───────────────────────────────────────────────────────────────────────────
   release_evidence:
     name: Build, attest & attach release evidence
@@ -135,77 +158,10 @@ jobs:
           subject-digest:   ${{ steps.build.outputs.digest }}
           push-to-registry: true
 
-      # ── Test suite ────────────────────────────────────────────────────────
-      # Replace this step with a real test runner (pytest, go test, etc.).
-      # The script writes pass_count / fail_count to GITHUB_OUTPUT so the
-      # predicate below can embed an accurate summary.
-      - name: Run tests
-        id: run_tests
-        run: |
-          echo "Running POC test suite..."
-          pass_count=0
-          fail_count=0
-
-          run_test() {
-            local name="$1" result="$2"
-            if [ "$result" = "PASSED" ]; then
-              echo "  ✅ ${name}"; pass_count=$((pass_count + 1))
-            else
-              echo "  ❌ ${name}"; fail_count=$((fail_count + 1))
-            fi
-          }
-
-          run_test "test-dockerfile-exists"   "PASSED"
-          run_test "test-workflow-syntax"     "PASSED"
-          run_test "test-image-label-source"  "PASSED"
-          run_test "test-image-label-desc"    "PASSED"
-
-          echo ""
-          echo "Results: ${pass_count} passed, ${fail_count} failed"
-          [ "$fail_count" -ne 0 ] && { echo "::error::${fail_count} test(s) failed"; exit 1; }
-
-          echo "pass_count=${pass_count}" >> "$GITHUB_OUTPUT"
-          echo "fail_count=${fail_count}" >> "$GITHUB_OUTPUT"
-
-      # ── Attestation 2: Test Results ────────────────────────────────────────
-      # Custom predicate type https://example.com/test-results/v1 carries the
-      # structured test summary; actions/attest wraps it in a signed in-toto
-      # envelope and pushes it to the GHCR repository.
-      - name: Generate test-results predicate
-        run: |
-          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          cat > test-results.json << EOF
-          {
-            "testSuite":  "poc-unit-tests",
-            "imageRef":   "${{ steps.set_ref.outputs.artifact_ref }}",
-            "release":    "${{ needs.release_please.outputs.tag_name }}",
-            "timestamp":  "${TIMESTAMP}",
-            "results": [
-              {"name": "test-dockerfile-exists",  "status": "PASSED", "durationMs": 5},
-              {"name": "test-workflow-syntax",    "status": "PASSED", "durationMs": 8},
-              {"name": "test-image-label-source", "status": "PASSED", "durationMs": 4},
-              {"name": "test-image-label-desc",   "status": "PASSED", "durationMs": 3}
-            ],
-            "summary": {
-              "total":   4,
-              "passed":  ${{ steps.run_tests.outputs.pass_count }},
-              "failed":  ${{ steps.run_tests.outputs.fail_count }},
-              "skipped": 0
-            }
-          }
-          EOF
-
-      - name: Attest test results
-        id: attest_tests
-        uses: actions/attest@v2
-        with:
-          subject-name:     ${{ env.IMAGE_NAME }}
-          subject-digest:   ${{ steps.build.outputs.digest }}
-          predicate-type:   "https://example.com/test-results/v1"
-          predicate-path:   test-results.json
-          push-to-registry: true
-
-      # ── Verify both attestations ───────────────────────────────────────────
+      # ── Verify the build provenance attestation ─────────────────────────────
+      # Test-results and PR CI summary attestations are NOT verified here;
+      # they were already created and verified on the RC image during the
+      # Release Please PR lifecycle (see rc-attest-on-release-please-pr.yml).
       - name: Verify build provenance attestation
         id: verify_build
         run: |
@@ -213,15 +169,6 @@ jobs:
             "oci://${{ steps.set_ref.outputs.artifact_ref }}" \
             --owner "${{ github.repository_owner }}" \
             --predicate-type "https://slsa.dev/provenance/v1"
-          echo "status=PASSED" >> "$GITHUB_OUTPUT"
-
-      - name: Verify test-results attestation
-        id: verify_tests
-        run: |
-          gh attestation verify \
-            "oci://${{ steps.set_ref.outputs.artifact_ref }}" \
-            --owner "${{ github.repository_owner }}" \
-            --predicate-type "https://example.com/test-results/v1"
           echo "status=PASSED" >> "$GITHUB_OUTPUT"
 
       # ── Download attestation bundles ───────────────────────────────────────
@@ -269,16 +216,11 @@ jobs:
           | Attestation | Predicate Type | Status |
           |-------------|----------------|--------|
           | Build Provenance (SLSA) | \`https://slsa.dev/provenance/v1\` | ✅ ${{ steps.verify_build.outputs.status }} |
-          | Test Results | \`https://example.com/test-results/v1\` | ✅ ${{ steps.verify_tests.outputs.status }} |
 
-          ## Test Summary
-
-          | Test | Status |
-          |------|--------|
-          | test-dockerfile-exists  | ✅ PASSED |
-          | test-workflow-syntax    | ✅ PASSED |
-          | test-image-label-source | ✅ PASSED |
-          | test-image-label-desc   | ✅ PASSED |
+          > **Note:** Test-results and Release PR CI summary attestations were
+          > created and verified on the RC image during the Release Please PR
+          > lifecycle.  See the PR comment posted by
+          > \`rc-attest-on-release-please-pr.yml\` for RC attestation details.
 
           ## Attestation Bundles
 
@@ -319,7 +261,7 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "#### Attestations" >> "$GITHUB_STEP_SUMMARY"
           echo "- ✅ Build Provenance (SLSA)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- ✅ Test Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ℹ️  Test Results – validated on RC (see Release Please PR)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Evidence report and attestation bundles uploaded to the GitHub Release." \
             >> "$GITHUB_STEP_SUMMARY"

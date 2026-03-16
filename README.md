@@ -26,8 +26,8 @@ container attestation process driven by a **Release Please** PR lifecycle.
  release-please.yml  release_evidence job
    │
    ├─ build release image (from tagged commit)
-   ├─ attest_build + attest_tests (fresh attestations for the release image)
-   ├─ verify both attestations
+   ├─ attest build provenance (for the release image – different digest from RC)
+   ├─ verify build provenance attestation
    └─ upload compliance-evidence-*.md + attestation bundles to GitHub Release
 ```
 
@@ -54,7 +54,7 @@ container attestation process driven by a **Release Please** PR lifecycle.
 | Job | When | What |
 |-----|------|------|
 | `release_please` | every push to main | Runs `googleapis/release-please-action@v4` in manifest mode |
-| `release_evidence` | only when a release is cut | Builds release image, attests, verifies, uploads evidence to GitHub Release |
+| `release_evidence` | only when a release is cut | Builds release image, attests build provenance, verifies, uploads evidence to GitHub Release (test-results attestation is NOT repeated – it was validated on the RC) |
 
 ### `rc-attest-on-release-please-pr.yml`
 
