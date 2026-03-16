@@ -1,0 +1,430 @@
+name: RC Attestations – Release Please PR
+
+# ─────────────────────────────────────────────────────────────────────────────
+# This is the core attestation POC workflow.  It runs exclusively on the
+# Release Please PR and validates the release candidate (RC) image by creating
+# and verifying three signed attestations:
+#
+#   1. SLSA Build Provenance  – "this image digest was built from this
+#      commit by this workflow" (actions/attest-build-provenance)
+#
+#   2. Test Results           – "these tests passed against this image"
+#      (actions/attest with a custom predicate)
+#
+#   3. Release PR CI Summary  – optional aggregation of CI outcomes for each
+#      PR included in the release candidate (actions/attest, custom predicate)
+#
+# After all three attestations are verified, a summary comment is posted on
+# the Release Please PR with the RC image digest and the verification command.
+#
+# ── How to use ───────────────────────────────────────────────────────────────
+# This workflow is automatically triggered by the `pull_request` event.  The
+# first job (`build_and_push_rc`) detects whether the PR is a Release Please
+# PR and skips all further work if it is not.  All downstream jobs inherit
+# this guard via the `needs:` dependency chain.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read       # checkout
+  packages: write      # push image and attestations to GHCR
+  id-token: write      # obtain OIDC token for Sigstore attestation signing
+  attestations: write  # persist attestations via the GitHub attestations API
+  pull-requests: write # post the summary comment on the Release Please PR
+
+env:
+  # Canonical GHCR image path for the RC artifact.
+  # The /poc suffix scopes the image as a named package within this repo.
+  IMAGE_NAME: ghcr.io/${{ github.repository }}/poc
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 1 – Build and push the RC image
+  #
+  # Guard condition (applied to this job only; skipping it cascades to all
+  # downstream jobs automatically via the needs: chain):
+  #
+  #   The PR is considered a Release Please PR when EITHER:
+  #     a) its title starts with "chore(main): release"
+  #        (the default Release Please PR title format for target branch main)
+  #     b) its head branch contains "release-please"
+  #        (googleapis/release-please-action creates branches like
+  #         release-please--branches--main--components--...)
+  #
+  # The image is tagged with the PR number and run ID for human traceability,
+  # but the digest (sha256:...) is the stable identity used everywhere else.
+  # ───────────────────────────────────────────────────────────────────────────
+  build_and_push_rc:
+    name: Build & push RC image
+    runs-on: ubuntu-latest
+    if: >-
+      startsWith(github.event.pull_request.title, 'chore(main): release') ||
+      contains(github.head_ref, 'release-please')
+    outputs:
+      artifact_ref: ${{ steps.set_ref.outputs.artifact_ref }}
+      digest:       ${{ steps.build.outputs.digest }}
+
+    steps:
+      # Always check out the exact PR head SHA so the build is reproducible
+      # and the provenance attestation records the correct source commit.
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build and push.  The tag is for human convenience only; all downstream
+      # steps reference the image exclusively by its immutable digest.
+      - name: Build and push RC image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:rc-pr-${{ github.event.pull_request.number }}-run-${{ github.run_id }}
+
+      - name: Set artifact_ref output
+        id: set_ref
+        run: |
+          echo "artifact_ref=${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Step summary
+        run: |
+          echo "### 🐳 RC image pushed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image | \`${{ env.IMAGE_NAME }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Tag   | \`rc-pr-${{ github.event.pull_request.number }}-run-${{ github.run_id }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Digest | \`${{ steps.build.outputs.digest }}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 2 – SLSA Build Provenance Attestation
+  #
+  # Creates a Sigstore-signed provenance statement:
+  #   "The image with digest <D> was produced by workflow run <R> from
+  #    commit <C> in repository <REPO>."
+  #
+  # The attestation is pushed to GHCR alongside the image so it travels
+  # with the artifact through any downstream distribution.
+  # ───────────────────────────────────────────────────────────────────────────
+  attest_build:
+    name: Attest build provenance
+    runs-on: ubuntu-latest
+    needs: build_and_push_rc
+
+    steps:
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name:     ${{ env.IMAGE_NAME }}
+          subject-digest:   ${{ needs.build_and_push_rc.outputs.digest }}
+          push-to-registry: true
+
+      - name: Step summary
+        run: |
+          echo "### ✅ Build provenance attestation created" >> "$GITHUB_STEP_SUMMARY"
+          echo "Bundle: \`${{ steps.attest.outputs.bundle-path }}\`" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 3 – Test Results Attestation
+  #
+  # Runs the test suite against the checked-out code, then creates a signed
+  # custom attestation (predicate type: https://example.com/test-results/v1)
+  # bound to the RC image digest.
+  #
+  # Replace the "Run tests" step with your real test runner (pytest, go test,
+  # jest, etc.).  The step must write pass_count and fail_count to
+  # $GITHUB_OUTPUT and exit non-zero on failure to gate the workflow.
+  # ───────────────────────────────────────────────────────────────────────────
+  attest_tests:
+    name: Attest test results
+    runs-on: ubuntu-latest
+    needs: build_and_push_rc
+
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      # ── Run the test suite ─────────────────────────────────────────────────
+      # Replace this block with a real test runner.
+      - name: Run tests
+        id: run_tests
+        run: |
+          echo "Running POC test suite..."
+          pass_count=0
+          fail_count=0
+
+          run_test() {
+            local name="$1" result="$2"
+            if [ "$result" = "PASSED" ]; then
+              echo "  ✅ ${name}"; pass_count=$((pass_count + 1))
+            else
+              echo "  ❌ ${name}"; fail_count=$((fail_count + 1))
+            fi
+          }
+
+          run_test "test-dockerfile-exists"   "PASSED"
+          run_test "test-workflow-syntax"     "PASSED"
+          run_test "test-image-label-source"  "PASSED"
+          run_test "test-image-label-desc"    "PASSED"
+
+          echo ""
+          echo "Results: ${pass_count} passed, ${fail_count} failed"
+          [ "$fail_count" -ne 0 ] && { echo "::error::${fail_count} test(s) failed"; exit 1; }
+
+          echo "pass_count=${pass_count}" >> "$GITHUB_OUTPUT"
+          echo "fail_count=${fail_count}" >> "$GITHUB_OUTPUT"
+
+      # ── Build the predicate JSON ────────────────────────────────────────────
+      - name: Generate test-results predicate
+        run: |
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          cat > test-results.json << EOF
+          {
+            "testSuite":  "poc-unit-tests",
+            "imageRef":   "${{ needs.build_and_push_rc.outputs.artifact_ref }}",
+            "timestamp":  "${TIMESTAMP}",
+            "results": [
+              {"name": "test-dockerfile-exists",  "status": "PASSED", "durationMs": 5},
+              {"name": "test-workflow-syntax",    "status": "PASSED", "durationMs": 8},
+              {"name": "test-image-label-source", "status": "PASSED", "durationMs": 4},
+              {"name": "test-image-label-desc",   "status": "PASSED", "durationMs": 3}
+            ],
+            "summary": {
+              "total":   4,
+              "passed":  ${{ steps.run_tests.outputs.pass_count }},
+              "failed":  ${{ steps.run_tests.outputs.fail_count }},
+              "skipped": 0
+            }
+          }
+          EOF
+
+      - name: Attest test results
+        id: attest
+        uses: actions/attest@v2
+        with:
+          subject-name:     ${{ env.IMAGE_NAME }}
+          subject-digest:   ${{ needs.build_and_push_rc.outputs.digest }}
+          predicate-type:   "https://example.com/test-results/v1"
+          predicate-path:   test-results.json
+          push-to-registry: true
+
+      - name: Step summary
+        run: |
+          echo "### ✅ Test-results attestation created" >> "$GITHUB_STEP_SUMMARY"
+          echo "Bundle: \`${{ steps.attest.outputs.bundle-path }}\`" \
+            >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Test | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| test-dockerfile-exists  | ✅ PASSED |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| test-workflow-syntax    | ✅ PASSED |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| test-image-label-source | ✅ PASSED |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| test-image-label-desc   | ✅ PASSED |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 4 (Optional) – Release PR CI Summary Attestation
+  #
+  # Creates a third signed attestation (predicate type:
+  #   https://example.com/release-pr-ci-summary/v1) that aggregates the CI
+  # outcomes of every PR included in this release candidate.
+  #
+  # POC behaviour: PR data is mocked (one synthetic PR, status SUCCESS).
+  # In production, replace the "Collect included PR CI data" step with real
+  # GitHub API calls to enumerate merged PRs and their check-run statuses:
+  #
+  #   gh api "repos/$REPO/pulls?state=closed&base=main" \
+  #     | jq '[.[] | {number, title, head_sha: .head.sha}]'
+  #
+  # Optional gating: if any included PR fails its required CI checks, the
+  # "Gate check" step exits non-zero, blocking verify_and_comment and surfacing
+  # the failure in the Release Please PR before merge.
+  # ───────────────────────────────────────────────────────────────────────────
+  attest_pr_summary:
+    name: Attest release PR CI summary (optional)
+    runs-on: ubuntu-latest
+    needs: build_and_push_rc
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      # ── Collect CI outcomes for included PRs (mocked for POC) ─────────────
+      - name: Collect included PR CI data
+        id: collect
+        run: |
+          echo "Collecting CI outcomes for PRs in this release candidate..."
+          echo "(POC: using mocked PR data – replace with real GitHub API calls)"
+
+          # In production, query the GitHub API here:
+          #   gh api "repos/${{ github.repository }}/pulls?state=closed&base=main"
+          # and check each PR's required status checks.
+
+          cat > pr-ci-data.json << EOF
+          {
+            "releasePRNumber": ${{ github.event.pull_request.number }},
+            "includedPRs": [
+              {
+                "number":   1,
+                "title":    "feat: initial project scaffold",
+                "sha":      "abc0000000000000000000000000000000000001",
+                "ciStatus": "SUCCESS"
+              }
+            ],
+            "allCIPassed": true,
+            "gatePassed":  true
+          }
+          EOF
+
+          echo "gate_passed=true" >> "$GITHUB_OUTPUT"
+
+      # ── Build the predicate JSON ────────────────────────────────────────────
+      - name: Generate release-PR-summary predicate
+        run: |
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          # Merge the collected PR data with attestation metadata.
+          jq \
+            --arg ts  "$TIMESTAMP" \
+            --arg ref "${{ needs.build_and_push_rc.outputs.artifact_ref }}" \
+            '. + {timestamp: $ts, artifactRef: $ref}' \
+            pr-ci-data.json > release-pr-summary-predicate.json
+
+      - name: Attest release PR CI summary
+        id: attest
+        uses: actions/attest@v2
+        with:
+          subject-name:     ${{ env.IMAGE_NAME }}
+          subject-digest:   ${{ needs.build_and_push_rc.outputs.digest }}
+          predicate-type:   "https://example.com/release-pr-ci-summary/v1"
+          predicate-path:   release-pr-summary-predicate.json
+          push-to-registry: true
+
+      # ── Optional gate ──────────────────────────────────────────────────────
+      # Remove or set to continue-on-error to make this non-blocking.
+      - name: Gate check
+        if: steps.collect.outputs.gate_passed != 'true'
+        run: |
+          echo "::error::One or more included PRs failed CI. Release candidate blocked."
+          exit 1
+
+      - name: Step summary
+        run: |
+          echo "### ✅ Release PR CI summary attestation created" >> "$GITHUB_STEP_SUMMARY"
+          echo "Bundle: \`${{ steps.attest.outputs.bundle-path }}\`" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 5 – Verify all attestations and post a PR comment
+  #
+  # Verifies each of the three attestations using `gh attestation verify`,
+  # then posts a single summary comment on the Release Please PR containing:
+  #   - The immutable RC image digest
+  #   - Per-attestation verification status
+  #   - The `gh attestation verify` command for independent auditing
+  #
+  # Reviewers can run the printed command locally before approving the PR.
+  # ───────────────────────────────────────────────────────────────────────────
+  verify_and_comment:
+    name: Verify attestations & post PR comment
+    runs-on: ubuntu-latest
+    needs: [build_and_push_rc, attest_build, attest_tests, attest_pr_summary]
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      # Login required so that `gh attestation verify oci://...` can reach GHCR.
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify build provenance attestation
+        id: verify_build
+        run: |
+          gh attestation verify \
+            "oci://${{ needs.build_and_push_rc.outputs.artifact_ref }}" \
+            --owner "${{ github.repository_owner }}" \
+            --predicate-type "https://slsa.dev/provenance/v1"
+          echo "status=✅ PASSED" >> "$GITHUB_OUTPUT"
+
+      - name: Verify test-results attestation
+        id: verify_tests
+        run: |
+          gh attestation verify \
+            "oci://${{ needs.build_and_push_rc.outputs.artifact_ref }}" \
+            --owner "${{ github.repository_owner }}" \
+            --predicate-type "https://example.com/test-results/v1"
+          echo "status=✅ PASSED" >> "$GITHUB_OUTPUT"
+
+      - name: Verify release PR CI summary attestation
+        id: verify_summary
+        run: |
+          gh attestation verify \
+            "oci://${{ needs.build_and_push_rc.outputs.artifact_ref }}" \
+            --owner "${{ github.repository_owner }}" \
+            --predicate-type "https://example.com/release-pr-ci-summary/v1"
+          echo "status=✅ PASSED" >> "$GITHUB_OUTPUT"
+
+      # ── Post the summary comment on the Release Please PR ──────────────────
+      # This provides reviewers with a single, auditable reference for the RC
+      # image digest and the command to verify all attestations independently.
+      - name: Post PR comment
+        run: |
+          DIGEST="${{ needs.build_and_push_rc.outputs.digest }}"
+          ARTIFACT_REF="${{ needs.build_and_push_rc.outputs.artifact_ref }}"
+          OWNER="${{ github.repository_owner }}"
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          # Write the comment body to a file to avoid YAML/shell quoting issues
+          # with multi-line strings containing markdown special characters.
+          cat > /tmp/pr-comment.md << COMMENT
+          ## 🔏 RC Attestation Report
+
+          Workflow run: [\`${{ github.run_id }}\`](${RUN_URL})
+
+          | Field | Value |
+          |-------|-------|
+          | RC Image Digest | \`${DIGEST}\` |
+          | Full Artifact Ref | \`${ARTIFACT_REF}\` |
+
+          ### Attestation Verification
+
+          | Attestation | Predicate Type | Status |
+          |-------------|----------------|--------|
+          | Build Provenance (SLSA v1) | \`https://slsa.dev/provenance/v1\` | ${{ steps.verify_build.outputs.status }} |
+          | Test Results | \`https://example.com/test-results/v1\` | ${{ steps.verify_tests.outputs.status }} |
+          | Release PR CI Summary | \`https://example.com/release-pr-ci-summary/v1\` | ${{ steps.verify_summary.outputs.status }} |
+
+          ### Verify independently
+
+          \`\`\`bash
+          gh attestation verify oci://${ARTIFACT_REF} --owner ${OWNER}
+          \`\`\`
+
+          > Attestations are co-located with the image in GHCR and verified against Sigstore's public transparency log.
+          COMMENT
+
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --body-file /tmp/pr-comment.md
