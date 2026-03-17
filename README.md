@@ -16,7 +16,7 @@ container attestation process driven by a **Release Please** PR lifecycle.
           ▼ (Release Please PR is opened or updated)
  rc-attest-on-release-please-pr.yml
    │
-   ├─ build_and_push_rc   – build RC image → push to GHCR → capture sha256 digest
+   ├─ build_and_push_rc   – build RC image → push to GHCR as `vX.Y.Z-rc` → capture sha256 digest
    ├─ attest_build        – SLSA build-provenance attestation (signed, pushed to GHCR)
    ├─ attest_tests        – run tests → test-results attestation  (signed, pushed to GHCR)
    ├─ attest_pr_summary   – release PR CI summary attestation     (signed, pushed to GHCR)
@@ -26,7 +26,7 @@ container attestation process driven by a **Release Please** PR lifecycle.
  release-please.yml  release_evidence job
    │
    ├─ find RC digest from merged PR comment
-   ├─ promote RC → release tag (re-tag, same digest – no rebuild)
+   ├─ promote `vX.Y.Z-rc` → `vX.Y.Z` release tag (re-tag, same digest – no rebuild)
    ├─ attest release promotion (custom predicate recording the re-tag)
    ├─ verify all 4 attestations (3 from RC carry over + 1 promotion)
    └─ upload compliance-evidence-*.md + attestation bundles to GitHub Release
@@ -55,7 +55,7 @@ container attestation process driven by a **Release Please** PR lifecycle.
 | Job | When | What |
 |-----|------|------|
 | `release_please` | every push to main | Runs `googleapis/release-please-action@v4` in manifest mode |
-| `release_evidence` | only when a release is cut | Promotes RC image to release tag (same digest – no rebuild), attests the promotion, verifies all 4 attestations, uploads evidence to GitHub Release |
+| `release_evidence` | only when a release is cut | Promotes RC image (`vX.Y.Z-rc` → `vX.Y.Z`, same digest – no rebuild), attests the promotion, verifies all 4 attestations, uploads evidence to GitHub Release |
 
 ### `rc-attest-on-release-please-pr.yml`
 
@@ -67,7 +67,7 @@ container attestation process driven by a **Release Please** PR lifecycle.
 
 | Job | Purpose |
 |-----|---------|
-| `build_and_push_rc` | Build RC image from PR head SHA; push to GHCR; output digest |
+| `build_and_push_rc` | Build RC image from PR head SHA; push to GHCR as `vX.Y.Z-rc`; output digest |
 | `attest_build` | `actions/attest-build-provenance@v2` – SLSA provenance |
 | `attest_tests` | `actions/attest@v2` – custom test-results predicate |
 | `attest_pr_summary` | `actions/attest@v2` – release PR CI summary (mocked for POC) |
