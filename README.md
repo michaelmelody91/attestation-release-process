@@ -25,9 +25,10 @@ container attestation process driven by a **Release Please** PR lifecycle.
           ▼ (Release Please PR is merged → release is cut)
  release-please.yml  release_evidence job
    │
-   ├─ build release image (from tagged commit)
-   ├─ attest build provenance (for the release image – different digest from RC)
-   ├─ verify build provenance attestation
+   ├─ find RC digest from merged PR comment
+   ├─ promote RC → release tag (re-tag, same digest – no rebuild)
+   ├─ attest release promotion (custom predicate recording the re-tag)
+   ├─ verify all 4 attestations (3 from RC carry over + 1 promotion)
    └─ upload compliance-evidence-*.md + attestation bundles to GitHub Release
 ```
 
@@ -54,7 +55,7 @@ container attestation process driven by a **Release Please** PR lifecycle.
 | Job | When | What |
 |-----|------|------|
 | `release_please` | every push to main | Runs `googleapis/release-please-action@v4` in manifest mode |
-| `release_evidence` | only when a release is cut | Builds release image, attests build provenance, verifies, uploads evidence to GitHub Release (test-results attestation is NOT repeated – it was validated on the RC) |
+| `release_evidence` | only when a release is cut | Promotes RC image to release tag (same digest – no rebuild), attests the promotion, verifies all 4 attestations, uploads evidence to GitHub Release |
 
 ### `rc-attest-on-release-please-pr.yml`
 
@@ -121,3 +122,4 @@ transparency log and exits non-zero if any verification fails.
 | Real included-PR lookup | `rc-attest-on-release-please-pr.yml` | `attest_pr_summary` → `Collect included PR CI data` |
 | Different registry | Both workflows | `IMAGE_NAME` env var + login action |
 | Custom predicate types | Both workflows | `predicate-type:` inputs on `actions/attest` steps |
+| Promotion predicate type | `release-please.yml` | `release_evidence` → `Generate release-promotion predicate` |
