@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/michaelmelody91/attestation-release-process/compare/v0.3.1...v0.3.2) (2026-03-17)
+
+
+### Bug Fixes
+
+* attestation bundle artifact upload fails due to colon in filename ([#11](https://github.com/michaelmelody91/attestation-release-process/issues/11)) ([475440d](https://github.com/michaelmelody91/attestation-release-process/commit/475440d3fcd3802c05ef03e2d16c5e059e0dd681))
+
 ## [0.3.1](https://github.com/michaelmelody91/attestation-release-process/compare/v0.3.0...v0.3.1) (2026-03-17)
 
 
