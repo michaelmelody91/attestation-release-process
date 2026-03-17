@@ -18,10 +18,16 @@ name: RC Attestations – Release Please PR
 # the Release Please PR with the RC image digest and the verification command.
 #
 # ── How to use ───────────────────────────────────────────────────────────────
-# This workflow is automatically triggered by the `pull_request` event.  The
-# first job (`build_and_push_rc`) detects whether the PR is a Release Please
-# PR and skips all further work if it is not.  All downstream jobs inherit
-# this guard via the `needs:` dependency chain.
+# This workflow is scoped to Release Please PRs via two layers:
+#
+#   1. Trigger-level `paths` filter  – the workflow only fires when the PR
+#      diff includes `.release-please-manifest.json`, which Release Please
+#      always modifies (version bump).  Non-Release Please PRs never trigger
+#      this workflow at all, keeping the Checks tab clean.
+#
+#   2. Job-level `if` guard on `build_and_push_rc` – defence-in-depth check
+#      that the PR title or branch name matches the Release Please convention.
+#      All downstream jobs inherit this guard via the `needs:` dependency chain.
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -29,6 +35,12 @@ on:
     branches:
       - main
     types: [opened, synchronize, reopened]
+    # Only trigger when the Release Please manifest is in the PR diff.
+    # Release Please always modifies this file (version bump), so this
+    # effectively limits the workflow to Release Please PRs without
+    # requiring label-based filtering.
+    paths:
+      - '.release-please-manifest.json'
 
 permissions:
   contents: read       # checkout
@@ -46,8 +58,7 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   # Job 1 – Build and push the RC image
   #
-  # Guard condition (applied to this job only; skipping it cascades to all
-  # downstream jobs automatically via the needs: chain):
+  # Defence-in-depth guard (in addition to the trigger-level paths filter):
   #
   #   The PR is considered a Release Please PR when EITHER:
   #     a) its title starts with "chore(main): release"
@@ -56,8 +67,11 @@ jobs:
   #        (googleapis/release-please-action creates branches like
   #         release-please--branches--main--components--...)
   #
-  # The image is tagged with the PR number and run ID for human traceability,
-  # but the digest (sha256:...) is the stable identity used everywhere else.
+  #   Skipping this job cascades to all downstream jobs via needs: chain.
+  #
+  # The image is tagged with the release version suffixed by `-rc`
+  # (e.g. `v1.2.0-rc`) for human readability.  The digest (sha256:...) is
+  # still the stable identity used everywhere else.
   # ───────────────────────────────────────────────────────────────────────────
   build_and_push_rc:
     name: Build & push RC image
@@ -68,6 +82,8 @@ jobs:
     outputs:
       artifact_ref: ${{ steps.set_ref.outputs.artifact_ref }}
       digest:       ${{ steps.build.outputs.digest }}
+      rc_tag:       ${{ steps.version.outputs.rc_tag }}
+      version:      ${{ steps.version.outputs.version }}
 
     steps:
       # Always check out the exact PR head SHA so the build is reproducible
@@ -76,6 +92,29 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
+
+      # ── Extract the release version from the PR title ──────────────────────
+      # Release Please PR titles follow the format:
+      #   "chore(main): release X.Y.Z"
+      # We extract X.Y.Z and derive the RC tag "vX.Y.Z-rc".
+      - name: Extract version from PR title
+        id: version
+        run: |
+          PR_TITLE="${{ github.event.pull_request.title }}"
+          # Extract the version that follows "release" in the PR title to avoid
+          # matching unrelated version numbers elsewhere in the title.
+          VERSION=$(echo "$PR_TITLE" | grep -oP '(?<=release\s)[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+
+          if [ -z "$VERSION" ]; then
+            echo "::error::Could not extract version from PR title: ${PR_TITLE}"
+            exit 1
+          fi
+
+          RC_TAG="v${VERSION}-rc"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "rc_tag=${RC_TAG}" >> "$GITHUB_OUTPUT"
+          echo "Extracted version: ${VERSION}"
+          echo "RC tag: ${RC_TAG}"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -87,7 +126,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build and push.  The tag is for human convenience only; all downstream
+      # Build and push.  The tag uses the release version with an `-rc`
+      # suffix (e.g. `v1.2.0-rc`) for human readability.  All downstream
       # steps reference the image exclusively by its immutable digest.
       - name: Build and push RC image
         id: build
@@ -95,7 +135,7 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ env.IMAGE_NAME }}:rc-pr-${{ github.event.pull_request.number }}-run-${{ github.run_id }}
+          tags: ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.rc_tag }}
 
       - name: Set artifact_ref output
         id: set_ref
@@ -110,7 +150,7 @@ jobs:
           echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
           echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
           echo "| Image | \`${{ env.IMAGE_NAME }}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Tag   | \`rc-pr-${{ github.event.pull_request.number }}-run-${{ github.run_id }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| RC Tag | \`${{ steps.version.outputs.rc_tag }}\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Digest | \`${{ steps.build.outputs.digest }}\` |" >> "$GITHUB_STEP_SUMMARY"
 
   # ───────────────────────────────────────────────────────────────────────────
@@ -393,18 +433,21 @@ jobs:
         run: |
           DIGEST="${{ needs.build_and_push_rc.outputs.digest }}"
           ARTIFACT_REF="${{ needs.build_and_push_rc.outputs.artifact_ref }}"
+          RC_TAG="${{ needs.build_and_push_rc.outputs.rc_tag }}"
           OWNER="${{ github.repository_owner }}"
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           # Write the comment body to a file to avoid YAML/shell quoting issues
           # with multi-line strings containing markdown special characters.
           cat > /tmp/pr-comment.md << COMMENT
+          <!-- rc-digest: ${DIGEST} -->
           ## 🔏 RC Attestation Report
 
           Workflow run: [\`${{ github.run_id }}\`](${RUN_URL})
 
           | Field | Value |
           |-------|-------|
+          | RC Tag | \`${RC_TAG}\` |
           | RC Image Digest | \`${DIGEST}\` |
           | Full Artifact Ref | \`${ARTIFACT_REF}\` |
 
