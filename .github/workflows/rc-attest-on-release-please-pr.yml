@@ -88,7 +88,9 @@ jobs:
         id: version
         run: |
           PR_TITLE="${{ github.event.pull_request.title }}"
-          VERSION=$(echo "$PR_TITLE" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          # Extract the version that follows "release" in the PR title to avoid
+          # matching unrelated version numbers elsewhere in the title.
+          VERSION=$(echo "$PR_TITLE" | grep -oP '(?<=release\s)[0-9]+\.[0-9]+\.[0-9]+' | head -1)
 
           if [ -z "$VERSION" ]; then
             echo "::error::Could not extract version from PR title: ${PR_TITLE}"
@@ -425,6 +427,7 @@ jobs:
           # Write the comment body to a file to avoid YAML/shell quoting issues
           # with multi-line strings containing markdown special characters.
           cat > /tmp/pr-comment.md << COMMENT
+          <!-- rc-digest: ${DIGEST} -->
           ## 🔏 RC Attestation Report
 
           Workflow run: [\`${{ github.run_id }}\`](${RUN_URL})

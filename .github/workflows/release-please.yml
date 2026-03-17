@@ -152,13 +152,13 @@ jobs:
           fi
           echo "Found Release Please PR: #${PR_NUMBER}"
 
-          # Extract the RC digest from the attestation comment posted by
-          # the verify_and_comment job in rc-attest-on-release-please-pr.yml.
+          # Extract the RC digest from the machine-readable HTML comment
+          # posted by the verify_and_comment job in rc-attest-on-release-please-pr.yml.
           RC_DIGEST=$(gh pr view "$PR_NUMBER" \
             --repo "${{ github.repository }}" \
             --json comments \
-            --jq '[.comments[] | select(.body | contains("RC Attestation Report")) | .body] | last' \
-            | grep -m1 -oE 'sha256:[a-f0-9]{64}')
+            --jq '[.comments[] | select(.body | contains("rc-digest:")) | .body] | last' \
+            | grep -m1 -oP '(?<=rc-digest: )sha256:[a-f0-9]{64}')
           echo "digest=${RC_DIGEST}" >> "$GITHUB_OUTPUT"
 
           if [ -z "$RC_DIGEST" ]; then
@@ -166,6 +166,12 @@ jobs:
             exit 1
           fi
           echo "Found RC digest: ${RC_DIGEST}"
+
+          # Derive the RC tag from the release tag (e.g. v1.2.0 → v1.2.0-rc)
+          RELEASE_TAG="${{ needs.release_please.outputs.tag_name }}"
+          RC_TAG="${RELEASE_TAG}-rc"
+          echo "rc_tag=${RC_TAG}" >> "$GITHUB_OUTPUT"
+          echo "RC tag: ${RC_TAG}"
 
       # ── Promote the RC image to the release tag ────────────────────────────
       # Re-tag the RC image with the release version.  This does NOT rebuild –
@@ -204,8 +210,7 @@ jobs:
         run: |
           TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           RELEASE_TAG="${{ needs.release_please.outputs.tag_name }}"
-          # Derive the RC tag from the release tag (e.g. v1.2.0 → v1.2.0-rc)
-          RC_TAG="${RELEASE_TAG}-rc"
+          RC_TAG="${{ steps.rc.outputs.rc_tag }}"
           cat > promotion-predicate.json << EOF
           {
             "promotionType":   "re-tag",
@@ -357,7 +362,7 @@ jobs:
         run: |
           DIGEST="${{ steps.rc.outputs.digest }}"
           RELEASE_TAG="${{ needs.release_please.outputs.tag_name }}"
-          RC_TAG="${RELEASE_TAG}-rc"
+          RC_TAG="${{ steps.rc.outputs.rc_tag }}"
           echo "### 🚀 Release evidence attached" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
