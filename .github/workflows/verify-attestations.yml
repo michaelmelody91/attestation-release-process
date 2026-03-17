@@ -390,7 +390,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: attestation-bundles-${{ inputs.release_tag }}
-          path: attestation-bundles/
+          path: attestation-bundles
 
       # ── Step summary ───────────────────────────────────────────────────────
       - name: Summary
