@@ -61,9 +61,9 @@ container attestation process driven by a **Release Please** PR lifecycle.
 
 **Triggers:** `pull_request` targeting `main` (opened / synchronize / reopened)
 
-> **Only runs on the Release Please PR**, detected by:
-> - PR title starting with `chore(main): release` (default Release Please title)
-> - **OR** head branch containing `release-please`
+> **Only runs on the Release Please PR**, scoped by two layers:
+> 1. **Trigger-level `paths` filter** – the workflow only fires when `.release-please-manifest.json` is in the PR diff (Release Please always modifies this file)
+> 2. **Job-level `if` guard** – defence-in-depth check on PR title (`chore(main): release`) or head branch (`release-please`)
 
 | Job | Purpose |
 |-----|---------|

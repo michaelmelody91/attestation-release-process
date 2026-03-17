@@ -18,10 +18,16 @@ name: RC Attestations – Release Please PR
 # the Release Please PR with the RC image digest and the verification command.
 #
 # ── How to use ───────────────────────────────────────────────────────────────
-# This workflow is automatically triggered by the `pull_request` event.  The
-# first job (`build_and_push_rc`) detects whether the PR is a Release Please
-# PR and skips all further work if it is not.  All downstream jobs inherit
-# this guard via the `needs:` dependency chain.
+# This workflow is scoped to Release Please PRs via two layers:
+#
+#   1. Trigger-level `paths` filter  – the workflow only fires when the PR
+#      diff includes `.release-please-manifest.json`, which Release Please
+#      always modifies (version bump).  Non-Release Please PRs never trigger
+#      this workflow at all, keeping the Checks tab clean.
+#
+#   2. Job-level `if` guard on `build_and_push_rc` – defence-in-depth check
+#      that the PR title or branch name matches the Release Please convention.
+#      All downstream jobs inherit this guard via the `needs:` dependency chain.
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -29,6 +35,12 @@ on:
     branches:
       - main
     types: [opened, synchronize, reopened]
+    # Only trigger when the Release Please manifest is in the PR diff.
+    # Release Please always modifies this file (version bump), so this
+    # effectively limits the workflow to Release Please PRs without
+    # requiring label-based filtering.
+    paths:
+      - '.release-please-manifest.json'
 
 permissions:
   contents: read       # checkout
@@ -46,8 +58,7 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   # Job 1 – Build and push the RC image
   #
-  # Guard condition (applied to this job only; skipping it cascades to all
-  # downstream jobs automatically via the needs: chain):
+  # Defence-in-depth guard (in addition to the trigger-level paths filter):
   #
   #   The PR is considered a Release Please PR when EITHER:
   #     a) its title starts with "chore(main): release"
@@ -55,6 +66,8 @@ jobs:
   #     b) its head branch contains "release-please"
   #        (googleapis/release-please-action creates branches like
   #         release-please--branches--main--components--...)
+  #
+  #   Skipping this job cascades to all downstream jobs via needs: chain.
   #
   # The image is tagged with the release version suffixed by `-rc`
   # (e.g. `v1.2.0-rc`) for human readability.  The digest (sha256:...) is
