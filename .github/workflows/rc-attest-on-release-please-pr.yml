@@ -192,8 +192,9 @@ jobs:
   # Job 3 – Test Results Attestation
   #
   # Runs the test suite against the checked-out code, then creates a signed
-  # custom attestation (predicate type: https://example.com/test-results/v1)
-  # bound to the RC image digest.
+  # attestation using the in-toto standard test-result predicate
+  # (https://in-toto.io/attestation/test-result/v0.1) bound to the RC image
+  # digest.
   #
   # Replace the "Run tests" step with your real test runner (pytest, go test,
   # jest, etc.).  The step must write pass_count and fail_count to
@@ -246,24 +247,42 @@ jobs:
           echo "fail_count=${fail_count}" >> "$GITHUB_OUTPUT"
 
       # ── Build the predicate JSON ────────────────────────────────────────────
+      # Uses the in-toto standard test-result predicate schema:
+      #   https://in-toto.io/attestation/test-result/v0.1
       - name: Generate test-results predicate
         run: |
           TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          PASS_COUNT=${{ steps.run_tests.outputs.pass_count }}
+          FAIL_COUNT=${{ steps.run_tests.outputs.fail_count }}
+
+          if [ "$FAIL_COUNT" -eq 0 ]; then
+            RESULT="PASSED"
+          else
+            RESULT="FAILED"
+          fi
+
           cat > test-results.json << EOF
           {
-            "testSuite":  "poc-unit-tests",
-            "imageRef":   "${{ needs.build_and_push_rc.outputs.artifact_ref }}",
-            "timestamp":  "${TIMESTAMP}",
-            "results": [
-              {"name": "test-dockerfile-exists",  "status": "PASSED", "durationMs": 5},
-              {"name": "test-workflow-syntax",    "status": "PASSED", "durationMs": 8},
-              {"name": "test-image-label-source", "status": "PASSED", "durationMs": 4},
-              {"name": "test-image-label-desc",   "status": "PASSED", "durationMs": 3}
+            "result": "${RESULT}",
+            "configuration": {
+              "testSuite": "poc-unit-tests",
+              "imageRef":  "${{ needs.build_and_push_rc.outputs.artifact_ref }}"
+            },
+            "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "passedTests": [
+              "test-dockerfile-exists",
+              "test-workflow-syntax",
+              "test-image-label-source",
+              "test-image-label-desc"
             ],
+            "failedTests":  [],
+            "warnedTests":  [],
+            "skippedTests": [],
+            "timestamp": "${TIMESTAMP}",
             "summary": {
               "total":   4,
-              "passed":  ${{ steps.run_tests.outputs.pass_count }},
-              "failed":  ${{ steps.run_tests.outputs.fail_count }},
+              "passed":  ${PASS_COUNT},
+              "failed":  ${FAIL_COUNT},
               "skipped": 0
             }
           }
@@ -275,7 +294,7 @@ jobs:
         with:
           subject-name:     ${{ env.IMAGE_NAME }}
           subject-digest:   ${{ needs.build_and_push_rc.outputs.digest }}
-          predicate-type:   "https://example.com/test-results/v1"
+          predicate-type:   "https://in-toto.io/attestation/test-result/v0.1"
           predicate-path:   test-results.json
           push-to-registry: true
 
@@ -295,9 +314,10 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   # Job 4 (Optional) – Release PR CI Summary Attestation
   #
-  # Creates a third signed attestation (predicate type:
-  #   https://example.com/release-pr-ci-summary/v1) that aggregates the CI
-  # outcomes of every PR included in this release candidate.
+  # Creates a third signed attestation using the in-toto SCAI attribute
+  # report predicate (https://in-toto.io/attestation/scai/attribute-report/v0.2)
+  # that aggregates the CI outcomes of every PR included in this release
+  # candidate.
   #
   # POC behaviour: PR data is mocked (one synthetic PR, status SUCCESS).
   # In production, replace the "Collect included PR CI data" step with real
@@ -354,15 +374,51 @@ jobs:
           echo "gate_passed=true" >> "$GITHUB_OUTPUT"
 
       # ── Build the predicate JSON ────────────────────────────────────────────
+      # Uses the in-toto SCAI attribute report predicate schema:
+      #   https://in-toto.io/attestation/scai/attribute-report/v0.2
       - name: Generate release-PR-summary predicate
         run: |
           TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          # Merge the collected PR data with attestation metadata.
-          jq \
-            --arg ts  "$TIMESTAMP" \
-            --arg ref "${{ needs.build_and_push_rc.outputs.artifact_ref }}" \
-            '. + {timestamp: $ts, artifactRef: $ref}' \
-            pr-ci-data.json > release-pr-summary-predicate.json
+          ARTIFACT_REF="${{ needs.build_and_push_rc.outputs.artifact_ref }}"
+          REPO="${{ github.repository }}"
+          RUN_URL="${{ github.server_url }}/${REPO}/actions/runs/${{ github.run_id }}"
+
+          cat > release-pr-summary-predicate.json << EOF
+          {
+            "attributes": [
+              {
+                "attribute": "CI_STATUS",
+                "target": {
+                  "type": "containerImage",
+                  "digest": {
+                    "sha256": "$(echo "${{ needs.build_and_push_rc.outputs.digest }}" | sed 's/sha256://')"
+                  }
+                },
+                "conditions": {
+                  "releasePRNumber": ${{ github.event.pull_request.number }},
+                  "allCIPassed": true,
+                  "gatePassed": true
+                },
+                "evidence": {
+                  "url": "${RUN_URL}",
+                  "includedPRs": [
+                    {
+                      "number": 1,
+                      "title": "feat: initial project scaffold",
+                      "sha": "abc0000000000000000000000000000000000001",
+                      "ciStatus": "SUCCESS"
+                    }
+                  ]
+                }
+              }
+            ],
+            "producer": {
+              "uri": "${RUN_URL}"
+            },
+            "timestamp": "${TIMESTAMP}",
+            "artifactRef": "${ARTIFACT_REF}"
+          }
+          EOF
 
       - name: Attest release PR CI summary
         id: attest
@@ -370,7 +426,7 @@ jobs:
         with:
           subject-name:     ${{ env.IMAGE_NAME }}
           subject-digest:   ${{ needs.build_and_push_rc.outputs.digest }}
-          predicate-type:   "https://example.com/release-pr-ci-summary/v1"
+          predicate-type:   "https://in-toto.io/attestation/scai/attribute-report/v0.2"
           predicate-path:   release-pr-summary-predicate.json
           push-to-registry: true
 
@@ -430,7 +486,7 @@ jobs:
           gh attestation verify \
             "oci://${{ needs.build_and_push_rc.outputs.artifact_ref }}" \
             --owner "${{ github.repository_owner }}" \
-            --predicate-type "https://example.com/test-results/v1"
+            --predicate-type "https://in-toto.io/attestation/test-result/v0.1"
           echo "status=✅ PASSED" >> "$GITHUB_OUTPUT"
 
       - name: Verify release PR CI summary attestation
@@ -439,7 +495,7 @@ jobs:
           gh attestation verify \
             "oci://${{ needs.build_and_push_rc.outputs.artifact_ref }}" \
             --owner "${{ github.repository_owner }}" \
-            --predicate-type "https://example.com/release-pr-ci-summary/v1"
+            --predicate-type "https://in-toto.io/attestation/scai/attribute-report/v0.2"
           echo "status=✅ PASSED" >> "$GITHUB_OUTPUT"
 
       # ── Post the summary comment on the Release Please PR ──────────────────
@@ -472,8 +528,8 @@ jobs:
           | Attestation | Predicate Type | Status |
           |-------------|----------------|--------|
           | Build Provenance (SLSA v1) | \`https://slsa.dev/provenance/v1\` | ${{ steps.verify_build.outputs.status }} |
-          | Test Results | \`https://example.com/test-results/v1\` | ${{ steps.verify_tests.outputs.status }} |
-          | Release PR CI Summary | \`https://example.com/release-pr-ci-summary/v1\` | ${{ steps.verify_summary.outputs.status }} |
+          | Test Results | \`https://in-toto.io/attestation/test-result/v0.1\` | ${{ steps.verify_tests.outputs.status }} |
+          | Release PR CI Summary | \`https://in-toto.io/attestation/scai/attribute-report/v0.2\` | ${{ steps.verify_summary.outputs.status }} |
 
           ### Verify independently
 

@@ -3,6 +3,9 @@
 A self-contained **proof-of-concept** (POC) that demonstrates an end-to-end
 container attestation process driven by a **Release Please** PR lifecycle.
 
+All attestations use **standard in-toto / SLSA predicate types** for
+interoperability with the broader supply-chain security ecosystem.
+
 ---
 
 ## How it works
@@ -27,10 +30,23 @@ container attestation process driven by a **Release Please** PR lifecycle.
    │
    ├─ find RC digest from merged PR comment
    ├─ promote `vX.Y.Z-rc` → `vX.Y.Z` release tag (re-tag, same digest – no rebuild)
-   ├─ attest release promotion (custom predicate recording the re-tag)
+   ├─ attest release promotion (in-toto Link predicate recording the re-tag)
    ├─ verify all 4 attestations (3 from RC carry over + 1 promotion)
    └─ upload compliance-evidence-*.md + attestation bundles to GitHub Release
 ```
+
+---
+
+## Attestation predicate types
+
+All predicates follow established in-toto / SLSA standards:
+
+| Attestation | Predicate Type | Standard | Created By |
+|-------------|----------------|----------|------------|
+| Build Provenance | `https://slsa.dev/provenance/v1` | [SLSA Provenance v1](https://slsa.dev/provenance/v1) | RC workflow |
+| Test Results | `https://in-toto.io/attestation/test-result/v0.1` | [in-toto TestResult](https://github.com/in-toto/attestation/blob/main/spec/predicates/test-result.md) | RC workflow |
+| CI Summary | `https://in-toto.io/attestation/scai/attribute-report/v0.2` | [SCAI Attribute Report](https://github.com/in-toto/attestation/blob/main/spec/predicates/scai.md) | RC workflow |
+| Release Promotion | `https://in-toto.io/attestation/link/v0.3` | [in-toto Link](https://github.com/in-toto/attestation/blob/main/spec/predicates/link.md) | Release workflow |
 
 ---
 
@@ -43,7 +59,7 @@ container attestation process driven by a **Release Please** PR lifecycle.
 | `.release-please-manifest.json` | Current version tracked by Release Please |
 | `.github/workflows/release-please.yml` | Creates Release Please PRs; cuts releases; attaches evidence |
 | `.github/workflows/rc-attest-on-release-please-pr.yml` | RC build + 3 attestations + verification + PR comment |
-| `.github/workflows/verify-attestations.yml` | On-demand verification of all attestations for a release |
+| `.github/workflows/verify-attestations.yml` | On-demand auditor verification of all attestations for a release |
 
 ---
 
@@ -70,17 +86,77 @@ container attestation process driven by a **Release Please** PR lifecycle.
 |-----|---------|
 | `build_and_push_rc` | Build RC image from PR head SHA; push to GHCR as `vX.Y.Z-rc`; output digest |
 | `attest_build` | `actions/attest-build-provenance@v2` – SLSA provenance |
-| `attest_tests` | `actions/attest@v2` – custom test-results predicate |
-| `attest_pr_summary` | `actions/attest@v2` – release PR CI summary (mocked for POC) |
+| `attest_tests` | `actions/attest@v2` – in-toto test-result predicate |
+| `attest_pr_summary` | `actions/attest@v2` – SCAI attribute report for CI summary |
 | `verify_and_comment` | Verify all attestations; post PR comment with digest + verify command |
 
 ### `verify-attestations.yml`
 
 **Triggers:** `workflow_dispatch` (manual)
 
-On-demand workflow to independently verify all four attestations for a given
-release tag.  Resolves the image digest from the release tag, then runs
-`gh attestation verify` for each predicate type and posts a summary table.
+On-demand auditor workflow to independently verify all four attestations for a
+given release tag.  Designed for the use case: _"I want to validate v0.2.1"_.
+
+The workflow:
+1. Resolves the image digest from the release tag
+2. **Verifies image immutability** — confirms the RC and release tags share
+   the same digest (re-tagged, not rebuilt)
+3. **Verifies all 4 attestation signatures** against Sigstore's transparency log
+4. **Downloads and extracts attestation content** — displays test results,
+   promotion chain, and build provenance from the signed predicates
+5. **Generates a downloadable audit report** (Markdown) and uploads it as a
+   workflow artifact alongside the attestation bundles
+
+---
+
+## Auditor guide
+
+### Validating a specific release
+
+An auditor can validate any released artifact by running the verification
+workflow:
+
+1. Go to **Actions → Verify Release Attestations → Run workflow**
+2. Enter the release tag (e.g. `v0.2.1`)
+3. The workflow produces:
+   - **Step summary** with image identity, immutability check, attestation
+     verification status, extracted test results, and promotion chain
+   - **Downloadable audit report** (Markdown) as a workflow artifact
+   - **Attestation bundles** (signed in-toto envelopes) as a workflow artifact
+
+### What the audit report covers
+
+| Section | What it tells the auditor |
+|---------|--------------------------|
+| Image Identity | Release tag, digest, RC tag, and full artifact reference |
+| Image Immutability | Whether the RC and release digests match (re-tag vs rebuild) |
+| Attestation Verification | Signature verification status for all 4 predicate types |
+| Test Results | Which test suite ran, overall result, list of passed/failed tests |
+| Promotion Chain | How the RC was promoted to release (materials, operation, tags) |
+| Build Provenance | Builder identity, source repository, and commit SHA |
+| Reproduce Locally | CLI commands to independently verify everything |
+
+### Using the CLI
+
+Verify attestations independently with the `gh` CLI:
+
+```bash
+# Replace <owner> with the GitHub username/org and <digest> with the sha256 value
+# from the PR comment or Release page.
+gh attestation verify \
+  oci://ghcr.io/<owner>/attestation-release-process/poc@<digest> \
+  --owner <owner>
+
+# Verify a specific predicate type
+gh attestation verify \
+  oci://ghcr.io/<owner>/attestation-release-process/poc@<digest> \
+  --owner <owner> \
+  --predicate-type "https://in-toto.io/attestation/test-result/v0.1"
+
+# Confirm image immutability (both should return the same digest)
+crane digest ghcr.io/<owner>/attestation-release-process/poc:v0.2.1
+crane digest ghcr.io/<owner>/attestation-release-process/poc:v0.2.1-rc
+```
 
 ---
 
@@ -107,46 +183,6 @@ release tag.  Resolves the image digest from the release tag, then runs
 
 ---
 
-## Verifying attestations
-
-### Using the verification workflow
-
-Go to **Actions → Verify Release Attestations → Run workflow** and enter a
-release tag (e.g. `v0.2.1`).  The workflow resolves the image digest, verifies
-all four predicate types, and posts a summary table in the run's step summary.
-
-### Using the CLI
-
-After any workflow run, verify the image's attestations with the `gh` CLI:
-
-```bash
-# Replace <digest> with the sha256 value from the PR comment or Release page.
-gh attestation verify \
-  oci://ghcr.io/<owner>/attestation-release-process/poc@<digest> \
-  --owner <owner>
-```
-
-The command verifies all stored attestations against Sigstore's public
-transparency log and exits non-zero if any verification fails.
-
-### Release 0.2.1 verification
-
-Release `v0.2.1` was verified on 2026-03-17.  All four attestations passed:
-
-| Attestation | Predicate Type | Origin | Status |
-|-------------|----------------|--------|--------|
-| Build Provenance (SLSA) | `https://slsa.dev/provenance/v1` | RC | ✅ PASSED |
-| Test Results | `https://example.com/test-results/v1` | RC | ✅ PASSED |
-| Release PR CI Summary | `https://example.com/release-pr-ci-summary/v1` | RC | ✅ PASSED |
-| Release Promotion | `https://example.com/release-promotion/v1` | Release | ✅ PASSED |
-
-Image digest: `sha256:eb6bd520879b09c48eb6895811e2bcd3ea1c99d5d939582da7ff897fd49a9fe0`
-
-Compliance evidence and attestation bundles are attached to the
-[v0.2.1 release](https://github.com/michaelmelody91/attestation-release-process/releases/tag/v0.2.1).
-
----
-
 ## Extending the POC
 
 | Replacement point | File | Step to modify |
@@ -154,5 +190,5 @@ Compliance evidence and attestation bundles are attached to the
 | Real test suite | `rc-attest-on-release-please-pr.yml` | `attest_tests` → `Run tests` |
 | Real included-PR lookup | `rc-attest-on-release-please-pr.yml` | `attest_pr_summary` → `Collect included PR CI data` |
 | Different registry | Both workflows | `IMAGE_NAME` env var + login action |
-| Custom predicate types | Both workflows | `predicate-type:` inputs on `actions/attest` steps |
+| Predicate types | Both workflows | `predicate-type:` inputs on `actions/attest` steps |
 | Promotion predicate type | `release-please.yml` | `release_evidence` → `Generate release-promotion predicate` |
