@@ -169,6 +169,11 @@ jobs:
     needs: build_and_push_rc
 
     steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - name: Attest build provenance
         id: attest
         uses: actions/attest-build-provenance@v2
