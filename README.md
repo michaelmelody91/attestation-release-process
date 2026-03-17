@@ -141,7 +141,8 @@ workflow:
 Verify attestations independently with the `gh` CLI:
 
 ```bash
-# Replace <digest> with the sha256 value from the PR comment or Release page.
+# Replace <owner> with the GitHub username/org and <digest> with the sha256 value
+# from the PR comment or Release page.
 gh attestation verify \
   oci://ghcr.io/<owner>/attestation-release-process/poc@<digest> \
   --owner <owner>
