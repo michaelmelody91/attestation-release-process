@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/michaelmelody91/attestation-release-process/compare/v0.3.0...v0.3.1) (2026-03-17)
+
+
+### Bug Fixes
+
+* Fix path for uploading attestation bundles ([c11afdb](https://github.com/michaelmelody91/attestation-release-process/commit/c11afdb811daadc19db90a81b00786cf3aa0bfa1))
+
 ## [0.3.0](https://github.com/michaelmelody91/attestation-release-process/compare/v0.2.1...v0.3.0) (2026-03-17)
 
 
