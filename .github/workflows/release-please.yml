@@ -208,7 +208,7 @@ jobs:
             "promotionType":   "re-tag",
             "rcDigest":        "${{ steps.rc.outputs.digest }}",
             "releaseTag":      "${{ needs.release_please.outputs.tag_name }}",
-            "sourcePR":        ${{ steps.rc.outputs.pr_number }},
+            "sourcePR":        "${{ steps.rc.outputs.pr_number }}",
             "repository":      "${{ github.repository }}",
             "timestamp":       "${TIMESTAMP}",
             "digestPreserved": true,
