@@ -281,12 +281,12 @@ jobs:
       - name: Download attestation bundles
         run: |
           mkdir -p attestation-bundles
+          cd attestation-bundles
           gh attestation download \
             "oci://${{ steps.promote.outputs.artifact_ref }}" \
-            --owner "${{ github.repository_owner }}" \
-            -d attestation-bundles
+            --owner "${{ github.repository_owner }}"
           echo "Downloaded attestation files:"
-          ls -lh attestation-bundles/
+          ls -lh
 
       # ── Generate the compliance evidence report ────────────────────────────
       - name: Generate compliance evidence report
