@@ -1,16 +1,26 @@
 name: Verify Release Attestations
 
 # ─────────────────────────────────────────────────────────────────────────────
-# On-demand workflow to verify all attestations for a given release.
+# On-demand auditor workflow to verify all attestations for a given release.
 #
-# Use this to independently confirm that a release image's attestations are
-# intact and verifiable against Sigstore's public transparency log.
+# Designed for the use case: "I want to validate v0.2.1" — an auditor picks
+# a release at random and can independently confirm:
+#
+#   1. All attestation signatures are valid (Sigstore transparency log)
+#   2. The image is immutable (RC digest == release digest)
+#   3. Which tests ran and their results (extracted from attestation content)
+#   4. The full promotion chain from RC to release
 #
 # Checks all four predicate types produced by the release process:
-#   1. SLSA Build Provenance  (from RC)
-#   2. Test Results            (from RC)
-#   3. Release PR CI Summary   (from RC)
-#   4. Release Promotion       (from release)
+#   1. SLSA Build Provenance       (https://slsa.dev/provenance/v1)
+#   2. Test Results                 (https://in-toto.io/attestation/test-result/v0.1)
+#   3. Release PR CI Summary        (https://in-toto.io/attestation/scai/attribute-report/v0.2)
+#   4. Release Promotion            (https://in-toto.io/attestation/link/v0.3)
+#
+# Outputs:
+#   - Step summary with full attestation details
+#   - Downloadable audit-report artifact (Markdown)
+#   - Downloadable attestation-bundles artifact (signed in-toto envelopes)
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -44,10 +54,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Resolve image digest
+      # ── Resolve image digests and verify immutability ──────────────────────
+      - name: Resolve image digest and verify immutability
         id: resolve
         run: |
           RELEASE_TAG="${{ inputs.release_tag }}"
+
+          # Resolve the release image digest
           DIGEST=$(crane digest "${{ env.IMAGE_NAME }}:${RELEASE_TAG}")
           if [ -z "$DIGEST" ]; then
             echo "::error::Could not resolve digest for ${{ env.IMAGE_NAME }}:${RELEASE_TAG}"
@@ -58,6 +71,28 @@ jobs:
           echo "artifact_ref=${ARTIFACT_REF}" >> "$GITHUB_OUTPUT"
           echo "Resolved ${RELEASE_TAG} → ${DIGEST}"
 
+          # Check whether an RC tag exists and compare digests
+          RC_TAG="${RELEASE_TAG}-rc"
+          echo "rc_tag=${RC_TAG}" >> "$GITHUB_OUTPUT"
+
+          if RC_DIGEST=$(crane digest "${{ env.IMAGE_NAME }}:${RC_TAG}" 2>/dev/null); then
+            echo "rc_digest=${RC_DIGEST}" >> "$GITHUB_OUTPUT"
+            echo "Resolved ${RC_TAG} → ${RC_DIGEST}"
+
+            if [ "${DIGEST}" = "${RC_DIGEST}" ]; then
+              echo "immutable=true" >> "$GITHUB_OUTPUT"
+              echo "✅ Image is immutable: RC and release tags share the same digest"
+            else
+              echo "immutable=false" >> "$GITHUB_OUTPUT"
+              echo "::warning::Digest mismatch — RC=${RC_DIGEST}, Release=${DIGEST}"
+            fi
+          else
+            echo "rc_digest=not-found" >> "$GITHUB_OUTPUT"
+            echo "immutable=unknown" >> "$GITHUB_OUTPUT"
+            echo "::notice::RC tag ${RC_TAG} not found — immutability check skipped"
+          fi
+
+      # ── Verify all four attestation signatures ─────────────────────────────
       - name: Verify build provenance (SLSA)
         id: verify_build
         run: |
@@ -77,7 +112,7 @@ jobs:
           if gh attestation verify \
             "oci://${{ steps.resolve.outputs.artifact_ref }}" \
             --owner "${{ github.repository_owner }}" \
-            --predicate-type "https://example.com/test-results/v1"; then
+            --predicate-type "https://in-toto.io/attestation/test-result/v0.1"; then
             echo "status=✅ PASSED" >> "$GITHUB_OUTPUT"
           else
             echo "status=❌ FAILED" >> "$GITHUB_OUTPUT"
@@ -90,7 +125,7 @@ jobs:
           if gh attestation verify \
             "oci://${{ steps.resolve.outputs.artifact_ref }}" \
             --owner "${{ github.repository_owner }}" \
-            --predicate-type "https://example.com/release-pr-ci-summary/v1"; then
+            --predicate-type "https://in-toto.io/attestation/scai/attribute-report/v0.2"; then
             echo "status=✅ PASSED" >> "$GITHUB_OUTPUT"
           else
             echo "status=❌ FAILED" >> "$GITHUB_OUTPUT"
@@ -103,30 +138,327 @@ jobs:
           if gh attestation verify \
             "oci://${{ steps.resolve.outputs.artifact_ref }}" \
             --owner "${{ github.repository_owner }}" \
-            --predicate-type "https://example.com/release-promotion/v1"; then
+            --predicate-type "https://in-toto.io/attestation/link/v0.3"; then
             echo "status=✅ PASSED" >> "$GITHUB_OUTPUT"
           else
             echo "status=❌ FAILED" >> "$GITHUB_OUTPUT"
             echo "::error::Release-promotion verification failed"
           fi
 
+      # ── Download and extract attestation content ───────────────────────────
+      - name: Download attestation bundles
+        id: download
+        run: |
+          mkdir -p attestation-bundles
+          cd attestation-bundles
+          gh attestation download \
+            "oci://${{ steps.resolve.outputs.artifact_ref }}" \
+            --owner "${{ github.repository_owner }}"
+          echo "Downloaded attestation files:"
+          ls -lh
+          echo "bundle_dir=$(pwd)" >> "$GITHUB_OUTPUT"
+
+      - name: Extract attestation predicates
+        id: extract
+        run: |
+          BUNDLE_DIR="${{ steps.download.outputs.bundle_dir }}"
+          mkdir -p attestation-content
+
+          # Extract predicates from each attestation bundle (.jsonl files)
+          for bundle in "${BUNDLE_DIR}"/*.jsonl; do
+            [ -f "$bundle" ] || continue
+            # Each line in a .jsonl is a DSSE envelope; decode and extract predicates
+            while IFS= read -r line; do
+              # The payload is base64-encoded in-toto statement
+              PAYLOAD=$(echo "$line" | jq -r '.dsseEnvelope.payload // empty' 2>/dev/null)
+              [ -z "$PAYLOAD" ] && continue
+
+              STATEMENT=$(echo "$PAYLOAD" | base64 -d 2>/dev/null) || continue
+              PRED_TYPE=$(echo "$STATEMENT" | jq -r '.predicateType // empty' 2>/dev/null)
+              [ -z "$PRED_TYPE" ] && continue
+
+              # Save predicate content by type
+              case "$PRED_TYPE" in
+                "https://slsa.dev/provenance/v1")
+                  echo "$STATEMENT" | jq '.predicate' > attestation-content/build-provenance.json
+                  echo "Extracted build provenance predicate"
+                  ;;
+                "https://in-toto.io/attestation/test-result/v0.1")
+                  echo "$STATEMENT" | jq '.predicate' > attestation-content/test-results.json
+                  echo "Extracted test-results predicate"
+                  ;;
+                "https://in-toto.io/attestation/scai/attribute-report/v0.2")
+                  echo "$STATEMENT" | jq '.predicate' > attestation-content/ci-summary.json
+                  echo "Extracted CI summary predicate"
+                  ;;
+                "https://in-toto.io/attestation/link/v0.3")
+                  echo "$STATEMENT" | jq '.predicate' > attestation-content/release-promotion.json
+                  echo "Extracted release-promotion predicate"
+                  ;;
+              esac
+            done < "$bundle"
+          done
+
+          # Capture test results for the summary
+          if [ -f attestation-content/test-results.json ]; then
+            TEST_RESULT=$(jq -r '.result // "UNKNOWN"' attestation-content/test-results.json)
+            PASSED_TESTS=$(jq -r '.passedTests // [] | join(", ")' attestation-content/test-results.json)
+            FAILED_TESTS=$(jq -r '.failedTests // [] | join(", ")' attestation-content/test-results.json)
+            TEST_URL=$(jq -r '.url // "N/A"' attestation-content/test-results.json)
+            TEST_SUITE=$(jq -r '.configuration.testSuite // "N/A"' attestation-content/test-results.json)
+            TOTAL=$(jq -r '.summary.total // "N/A"' attestation-content/test-results.json)
+            PASSED=$(jq -r '.summary.passed // "N/A"' attestation-content/test-results.json)
+            FAILED=$(jq -r '.summary.failed // "N/A"' attestation-content/test-results.json)
+            echo "test_result=${TEST_RESULT}" >> "$GITHUB_OUTPUT"
+            echo "passed_tests=${PASSED_TESTS}" >> "$GITHUB_OUTPUT"
+            echo "failed_tests=${FAILED_TESTS}" >> "$GITHUB_OUTPUT"
+            echo "test_url=${TEST_URL}" >> "$GITHUB_OUTPUT"
+            echo "test_suite=${TEST_SUITE}" >> "$GITHUB_OUTPUT"
+            echo "test_total=${TOTAL}" >> "$GITHUB_OUTPUT"
+            echo "test_passed=${PASSED}" >> "$GITHUB_OUTPUT"
+            echo "test_failed=${FAILED}" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Capture promotion details for the summary
+          if [ -f attestation-content/release-promotion.json ]; then
+            PROMO_NAME=$(jq -r '.name // "N/A"' attestation-content/release-promotion.json)
+            RC_URI=$(jq -r '.materials[0].uri // "N/A"' attestation-content/release-promotion.json)
+            RC_HASH=$(jq -r '.materials[0].digest.sha256 // "N/A"' attestation-content/release-promotion.json)
+            RELEASE_TAG_PROMO=$(jq -r '.byproducts.releaseTag // "N/A"' attestation-content/release-promotion.json)
+            RC_TAG_PROMO=$(jq -r '.byproducts.rcTag // "N/A"' attestation-content/release-promotion.json)
+            DIGEST_PRESERVED=$(jq -r '.byproducts.digestPreserved // "N/A"' attestation-content/release-promotion.json)
+            echo "promo_name=${PROMO_NAME}" >> "$GITHUB_OUTPUT"
+            echo "promo_rc_uri=${RC_URI}" >> "$GITHUB_OUTPUT"
+            echo "promo_rc_hash=${RC_HASH}" >> "$GITHUB_OUTPUT"
+            echo "promo_release_tag=${RELEASE_TAG_PROMO}" >> "$GITHUB_OUTPUT"
+            echo "promo_rc_tag=${RC_TAG_PROMO}" >> "$GITHUB_OUTPUT"
+            echo "promo_digest_preserved=${DIGEST_PRESERVED}" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Capture build provenance details
+          if [ -f attestation-content/build-provenance.json ]; then
+            BUILD_ID=$(jq -r '.runDetails.builder.id // "N/A"' attestation-content/build-provenance.json)
+            SOURCE_URI=$(jq -r '.buildDefinition.resolvedDependencies[0].uri // "N/A"' attestation-content/build-provenance.json)
+            SOURCE_DIGEST=$(jq -r '.buildDefinition.resolvedDependencies[0].digest.gitCommit // "N/A"' attestation-content/build-provenance.json)
+            echo "build_builder_id=${BUILD_ID}" >> "$GITHUB_OUTPUT"
+            echo "build_source_uri=${SOURCE_URI}" >> "$GITHUB_OUTPUT"
+            echo "build_source_commit=${SOURCE_DIGEST}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Generate audit report and step summary ─────────────────────────────
+      - name: Generate audit report
+        run: |
+          RELEASE_TAG="${{ inputs.release_tag }}"
+          DIGEST="${{ steps.resolve.outputs.digest }}"
+          ARTIFACT_REF="${{ steps.resolve.outputs.artifact_ref }}"
+          RC_TAG="${{ steps.resolve.outputs.rc_tag }}"
+          RC_DIGEST="${{ steps.resolve.outputs.rc_digest }}"
+          IMMUTABLE="${{ steps.resolve.outputs.immutable }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          OWNER="${{ github.repository_owner }}"
+          REPO="${{ github.repository }}"
+
+          DIGEST_SHORT="${DIGEST#sha256:}"
+          DIGEST_SHORT="${DIGEST_SHORT:0:12}"
+          REPORT_FILE="audit-report-${RELEASE_TAG}-${DIGEST_SHORT}.md"
+
+          # Immutability status
+          if [ "$IMMUTABLE" = "true" ]; then
+            IMMUTABLE_STATUS="✅ VERIFIED — RC and release digests match"
+          elif [ "$IMMUTABLE" = "false" ]; then
+            IMMUTABLE_STATUS="❌ FAILED — RC and release digests differ"
+          else
+            IMMUTABLE_STATUS="⚠️ UNKNOWN — RC tag not found"
+          fi
+
+          cat > "${REPORT_FILE}" << REPORT
+          # Audit Report — ${RELEASE_TAG}
+
+          > Generated: ${TIMESTAMP}
+          > Auditor workflow run: ${{ github.server_url }}/${REPO}/actions/runs/${{ github.run_id }}
+
+          ## 1. Image Identity
+
+          | Field | Value |
+          |-------|-------|
+          | Release Tag | \`${RELEASE_TAG}\` |
+          | Image | \`${{ env.IMAGE_NAME }}\` |
+          | Release Digest | \`${DIGEST}\` |
+          | RC Tag | \`${RC_TAG}\` |
+          | RC Digest | \`${RC_DIGEST}\` |
+          | Full Artifact Ref | \`${ARTIFACT_REF}\` |
+
+          ## 2. Image Immutability
+
+          **${IMMUTABLE_STATUS}**
+
+          The release process promotes the RC image to the release tag by re-tagging
+          (not rebuilding).  If the digests match, the image binary is identical and
+          all RC attestations carry over to the release image.
+
+          ## 3. Attestation Signature Verification
+
+          All attestations are verified against Sigstore's public transparency log.
+
+          | Attestation | Predicate Type | Status |
+          |-------------|----------------|--------|
+          | Build Provenance (SLSA) | \`https://slsa.dev/provenance/v1\` | ${{ steps.verify_build.outputs.status }} |
+          | Test Results | \`https://in-toto.io/attestation/test-result/v0.1\` | ${{ steps.verify_tests.outputs.status }} |
+          | Release PR CI Summary | \`https://in-toto.io/attestation/scai/attribute-report/v0.2\` | ${{ steps.verify_summary.outputs.status }} |
+          | Release Promotion | \`https://in-toto.io/attestation/link/v0.3\` | ${{ steps.verify_promotion.outputs.status }} |
+
+          ## 4. Test Results (from attestation)
+
+          | Field | Value |
+          |-------|-------|
+          | Test Suite | \`${{ steps.extract.outputs.test_suite }}\` |
+          | Overall Result | **${{ steps.extract.outputs.test_result }}** |
+          | Total | ${{ steps.extract.outputs.test_total }} |
+          | Passed | ${{ steps.extract.outputs.test_passed }} |
+          | Failed | ${{ steps.extract.outputs.test_failed }} |
+          | Workflow Run | ${{ steps.extract.outputs.test_url }} |
+
+          **Passed tests:** ${{ steps.extract.outputs.passed_tests }}
+
+          **Failed tests:** ${{ steps.extract.outputs.failed_tests || 'None' }}
+
+          ## 5. Promotion Chain (from attestation)
+
+          | Field | Value |
+          |-------|-------|
+          | Operation | \`${{ steps.extract.outputs.promo_name }}\` |
+          | RC Image | \`${{ steps.extract.outputs.promo_rc_uri }}\` |
+          | RC Digest (sha256) | \`${{ steps.extract.outputs.promo_rc_hash }}\` |
+          | RC Tag | \`${{ steps.extract.outputs.promo_rc_tag }}\` |
+          | Release Tag | \`${{ steps.extract.outputs.promo_release_tag }}\` |
+          | Digest Preserved | ${{ steps.extract.outputs.promo_digest_preserved }} |
+
+          ## 6. Build Provenance (from attestation)
+
+          | Field | Value |
+          |-------|-------|
+          | Builder | \`${{ steps.extract.outputs.build_builder_id }}\` |
+          | Source | \`${{ steps.extract.outputs.build_source_uri }}\` |
+          | Commit | \`${{ steps.extract.outputs.build_source_commit }}\` |
+
+          ## 7. Reproduce Locally
+
+          Verify all attestations independently:
+
+          \`\`\`bash
+          # Verify all attestations
+          gh attestation verify \\
+            oci://${ARTIFACT_REF} \\
+            --owner ${OWNER}
+
+          # Verify individual predicate types
+          gh attestation verify oci://${ARTIFACT_REF} --owner ${OWNER} \\
+            --predicate-type "https://slsa.dev/provenance/v1"
+          gh attestation verify oci://${ARTIFACT_REF} --owner ${OWNER} \\
+            --predicate-type "https://in-toto.io/attestation/test-result/v0.1"
+          gh attestation verify oci://${ARTIFACT_REF} --owner ${OWNER} \\
+            --predicate-type "https://in-toto.io/attestation/scai/attribute-report/v0.2"
+          gh attestation verify oci://${ARTIFACT_REF} --owner ${OWNER} \\
+            --predicate-type "https://in-toto.io/attestation/link/v0.3"
+
+          # Confirm image immutability
+          crane digest ${{ env.IMAGE_NAME }}:${RELEASE_TAG}
+          crane digest ${{ env.IMAGE_NAME }}:${RC_TAG}
+          # Both commands should return the same sha256 digest
+          \`\`\`
+
+          ## Attestation Predicate Standards
+
+          | Attestation | Standard | Specification |
+          |-------------|----------|---------------|
+          | Build Provenance | SLSA v1 | https://slsa.dev/provenance/v1 |
+          | Test Results | in-toto TestResult v0.1 | https://in-toto.io/attestation/test-result/v0.1 |
+          | CI Summary | SCAI Attribute Report v0.2 | https://in-toto.io/attestation/scai/attribute-report/v0.2 |
+          | Promotion | in-toto Link v0.3 | https://in-toto.io/attestation/link/v0.3 |
+          REPORT
+
+          echo "REPORT_FILE=${REPORT_FILE}" >> "$GITHUB_ENV"
+
+      # ── Upload artifacts ───────────────────────────────────────────────────
+      - name: Upload audit report
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-report-${{ inputs.release_tag }}
+          path: ${{ env.REPORT_FILE }}
+
+      - name: Upload attestation bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: attestation-bundles-${{ inputs.release_tag }}
+          path: attestation-bundles/
+
+      # ── Step summary ───────────────────────────────────────────────────────
       - name: Summary
         run: |
           RELEASE_TAG="${{ inputs.release_tag }}"
           DIGEST="${{ steps.resolve.outputs.digest }}"
           ARTIFACT_REF="${{ steps.resolve.outputs.artifact_ref }}"
+          RC_TAG="${{ steps.resolve.outputs.rc_tag }}"
+          RC_DIGEST="${{ steps.resolve.outputs.rc_digest }}"
+          IMMUTABLE="${{ steps.resolve.outputs.immutable }}"
+          OWNER="${{ github.repository_owner }}"
 
-          echo "### 🔍 Attestation Verification – ${RELEASE_TAG}" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Release | \`${RELEASE_TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Digest | \`${DIGEST}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Image | \`${ARTIFACT_REF}\` |" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Attestation | Predicate Type | Status |" >> "$GITHUB_STEP_SUMMARY"
-          echo "|-------------|----------------|--------|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Build Provenance (SLSA) | \`https://slsa.dev/provenance/v1\` | ${{ steps.verify_build.outputs.status }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Test Results | \`https://example.com/test-results/v1\` | ${{ steps.verify_tests.outputs.status }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Release PR CI Summary | \`https://example.com/release-pr-ci-summary/v1\` | ${{ steps.verify_summary.outputs.status }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Release Promotion | \`https://example.com/release-promotion/v1\` | ${{ steps.verify_promotion.outputs.status }} |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$IMMUTABLE" = "true" ]; then
+            IMMUTABLE_ICON="✅"
+            IMMUTABLE_TEXT="VERIFIED — RC and release digests match"
+          elif [ "$IMMUTABLE" = "false" ]; then
+            IMMUTABLE_ICON="❌"
+            IMMUTABLE_TEXT="FAILED — RC (${RC_DIGEST}) ≠ Release (${DIGEST})"
+          else
+            IMMUTABLE_ICON="⚠️"
+            IMMUTABLE_TEXT="RC tag not found — skipped"
+          fi
+
+          cat >> "$GITHUB_STEP_SUMMARY" << SUMMARY
+
+          ### 🔍 Audit Report — ${RELEASE_TAG}
+
+          #### Image Identity
+          | Field | Value |
+          |-------|-------|
+          | Release | \`${RELEASE_TAG}\` |
+          | Digest | \`${DIGEST}\` |
+          | Image | \`${ARTIFACT_REF}\` |
+          | RC Tag | \`${RC_TAG}\` |
+
+          #### Image Immutability
+          | Check | Status |
+          |-------|--------|
+          | RC digest == Release digest | ${IMMUTABLE_ICON} ${IMMUTABLE_TEXT} |
+
+          #### Attestation Verification
+          | Attestation | Predicate Type (Standard) | Status |
+          |-------------|---------------------------|--------|
+          | Build Provenance | [\`slsa/provenance/v1\`](https://slsa.dev/provenance/v1) | ${{ steps.verify_build.outputs.status }} |
+          | Test Results | [\`in-toto/test-result/v0.1\`](https://in-toto.io/attestation/test-result/v0.1) | ${{ steps.verify_tests.outputs.status }} |
+          | CI Summary | [\`in-toto/scai/attribute-report/v0.2\`](https://in-toto.io/attestation/scai/attribute-report/v0.2) | ${{ steps.verify_summary.outputs.status }} |
+          | Release Promotion | [\`in-toto/link/v0.3\`](https://in-toto.io/attestation/link/v0.3) | ${{ steps.verify_promotion.outputs.status }} |
+
+          #### Test Results (extracted from attestation)
+          | Field | Value |
+          |-------|-------|
+          | Test Suite | \`${{ steps.extract.outputs.test_suite }}\` |
+          | Overall Result | **${{ steps.extract.outputs.test_result }}** |
+          | Passed | ${{ steps.extract.outputs.test_passed }} / ${{ steps.extract.outputs.test_total }} |
+          | Passed Tests | ${{ steps.extract.outputs.passed_tests }} |
+          | Failed Tests | ${{ steps.extract.outputs.failed_tests || 'None' }} |
+
+          #### Promotion Chain (extracted from attestation)
+          | Field | Value |
+          |-------|-------|
+          | Operation | \`${{ steps.extract.outputs.promo_name }}\` |
+          | RC → Release | \`${{ steps.extract.outputs.promo_rc_tag }}\` → \`${{ steps.extract.outputs.promo_release_tag }}\` |
+          | Digest Preserved | ${{ steps.extract.outputs.promo_digest_preserved }} |
+
+          #### Verify Independently
+          \`\`\`bash
+          gh attestation verify oci://${ARTIFACT_REF} --owner ${OWNER}
+          \`\`\`
+
+          > 📎 Full audit report and attestation bundles are available as downloadable artifacts on this workflow run.
+          SUMMARY

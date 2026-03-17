@@ -203,25 +203,40 @@ jobs:
           echo "artifact_ref=${{ env.IMAGE_NAME }}@${RC_DIGEST}" >> "$GITHUB_OUTPUT"
 
       # ── Attestation: Release Promotion ─────────────────────────────────────
-      # Records that the RC image was promoted to a release by re-tagging, not
-      # rebuilding.  The digest is identical, so all prior RC attestations
-      # remain valid for the release image.
+      # Records the supply chain step of promoting the RC image to a release
+      # by re-tagging.  Uses the in-toto Link predicate to capture the
+      # materials (RC image) and the operation performed.  The digest is
+      # identical, so all prior RC attestations remain valid for the release.
       - name: Generate release-promotion predicate
         run: |
           TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           RELEASE_TAG="${{ needs.release_please.outputs.tag_name }}"
           RC_TAG="${{ steps.rc.outputs.rc_tag }}"
+          RC_DIGEST="${{ steps.rc.outputs.digest }}"
+          RC_DIGEST_HEX="${RC_DIGEST#sha256:}"
+          REPO="${{ github.repository }}"
+          RUN_URL="${{ github.server_url }}/${REPO}/actions/runs/${{ github.run_id }}"
           cat > promotion-predicate.json << EOF
           {
-            "promotionType":   "re-tag",
-            "rcDigest":        "${{ steps.rc.outputs.digest }}",
-            "rcTag":           "${RC_TAG}",
-            "releaseTag":      "${RELEASE_TAG}",
-            "sourcePR":        "${{ steps.rc.outputs.pr_number }}",
-            "repository":      "${{ github.repository }}",
-            "timestamp":       "${TIMESTAMP}",
-            "digestPreserved": true,
-            "description":     "RC image (${RC_TAG}) promoted to release (${RELEASE_TAG}) by re-tagging. No rebuild. The digest is identical to the RC, so all RC attestations (build provenance, test results, PR CI summary) apply to this release image."
+            "name": "promote-rc-to-release",
+            "command": ["crane", "tag", "${{ env.IMAGE_NAME }}@${RC_DIGEST}", "${RELEASE_TAG}"],
+            "materials": [
+              {
+                "uri": "oci://${{ env.IMAGE_NAME }}:${RC_TAG}",
+                "digest": { "sha256": "${RC_DIGEST_HEX}" }
+              }
+            ],
+            "byproducts": {
+              "releaseTag":      "${RELEASE_TAG}",
+              "rcTag":           "${RC_TAG}",
+              "sourcePR":        "${{ steps.rc.outputs.pr_number }}",
+              "digestPreserved": true
+            },
+            "environment": {
+              "workflowRun": "${RUN_URL}",
+              "repository":  "${REPO}",
+              "timestamp":   "${TIMESTAMP}"
+            }
           }
           EOF
 
@@ -231,7 +246,7 @@ jobs:
         with:
           subject-name:     ${{ env.IMAGE_NAME }}
           subject-digest:   ${{ steps.rc.outputs.digest }}
-          predicate-type:   "https://example.com/release-promotion/v1"
+          predicate-type:   "https://in-toto.io/attestation/link/v0.3"
           predicate-path:   promotion-predicate.json
           push-to-registry: true
 
@@ -256,7 +271,7 @@ jobs:
           gh attestation verify \
             "oci://${{ steps.promote.outputs.artifact_ref }}" \
             --owner "${{ github.repository_owner }}" \
-            --predicate-type "https://example.com/test-results/v1"
+            --predicate-type "https://in-toto.io/attestation/test-result/v0.1"
           echo "status=PASSED" >> "$GITHUB_OUTPUT"
 
       - name: Verify release-PR CI summary attestation (from RC)
@@ -265,7 +280,7 @@ jobs:
           gh attestation verify \
             "oci://${{ steps.promote.outputs.artifact_ref }}" \
             --owner "${{ github.repository_owner }}" \
-            --predicate-type "https://example.com/release-pr-ci-summary/v1"
+            --predicate-type "https://in-toto.io/attestation/scai/attribute-report/v0.2"
           echo "status=PASSED" >> "$GITHUB_OUTPUT"
 
       - name: Verify release-promotion attestation
@@ -274,7 +289,7 @@ jobs:
           gh attestation verify \
             "oci://${{ steps.promote.outputs.artifact_ref }}" \
             --owner "${{ github.repository_owner }}" \
-            --predicate-type "https://example.com/release-promotion/v1"
+            --predicate-type "https://in-toto.io/attestation/link/v0.3"
           echo "status=PASSED" >> "$GITHUB_OUTPUT"
 
       # ── Download attestation bundles ───────────────────────────────────────
@@ -328,9 +343,9 @@ jobs:
           | Attestation | Predicate Type | Origin | Status |
           |-------------|----------------|--------|--------|
           | Build Provenance (SLSA) | \`https://slsa.dev/provenance/v1\` | RC | ✅ ${{ steps.verify_build.outputs.status }} |
-          | Test Results | \`https://example.com/test-results/v1\` | RC | ✅ ${{ steps.verify_tests.outputs.status }} |
-          | Release PR CI Summary | \`https://example.com/release-pr-ci-summary/v1\` | RC | ✅ ${{ steps.verify_summary.outputs.status }} |
-          | Release Promotion | \`https://example.com/release-promotion/v1\` | Release | ✅ ${{ steps.verify_promotion.outputs.status }} |
+          | Test Results | \`https://in-toto.io/attestation/test-result/v0.1\` | RC | ✅ ${{ steps.verify_tests.outputs.status }} |
+          | Release PR CI Summary | \`https://in-toto.io/attestation/scai/attribute-report/v0.2\` | RC | ✅ ${{ steps.verify_summary.outputs.status }} |
+          | Release Promotion | \`https://in-toto.io/attestation/link/v0.3\` | Release | ✅ ${{ steps.verify_promotion.outputs.status }} |
 
           ## Attestation Bundles
 
