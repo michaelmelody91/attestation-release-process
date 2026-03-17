@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/michaelmelody91/attestation-release-process/compare/v0.2.0...v0.2.1) (2026-03-17)
+
+
+### Bug Fixes
+
+* gh attestation download use cd instead of nonexistent directory flag ([#5](https://github.com/michaelmelody91/attestation-release-process/issues/5)) ([6af51d8](https://github.com/michaelmelody91/attestation-release-process/commit/6af51d8d0b672b5f440221428370ac51186127d4))
+
 ## [0.2.0](https://github.com/michaelmelody91/attestation-release-process/compare/v0.1.0...v0.2.0) (2026-03-17)
 
 
