@@ -154,6 +154,12 @@ jobs:
           gh attestation download \
             "oci://${{ steps.resolve.outputs.artifact_ref }}" \
             --owner "${{ github.repository_owner }}"
+          # Rename files: artifact uploads do not allow colons in filenames
+          shopt -s nullglob
+          for f in *:*; do
+            mv -- "$f" "${f//:/-}"
+          done
+          shopt -u nullglob
           echo "Downloaded attestation files:"
           ls -lh
           echo "bundle_dir=$(pwd)" >> "$GITHUB_OUTPUT"
