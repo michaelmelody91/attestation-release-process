@@ -43,6 +43,7 @@ container attestation process driven by a **Release Please** PR lifecycle.
 | `.release-please-manifest.json` | Current version tracked by Release Please |
 | `.github/workflows/release-please.yml` | Creates Release Please PRs; cuts releases; attaches evidence |
 | `.github/workflows/rc-attest-on-release-please-pr.yml` | RC build + 3 attestations + verification + PR comment |
+| `.github/workflows/verify-attestations.yml` | On-demand verification of all attestations for a release |
 
 ---
 
@@ -73,6 +74,14 @@ container attestation process driven by a **Release Please** PR lifecycle.
 | `attest_pr_summary` | `actions/attest@v2` – release PR CI summary (mocked for POC) |
 | `verify_and_comment` | Verify all attestations; post PR comment with digest + verify command |
 
+### `verify-attestations.yml`
+
+**Triggers:** `workflow_dispatch` (manual)
+
+On-demand workflow to independently verify all four attestations for a given
+release tag.  Resolves the image digest from the release tag, then runs
+`gh attestation verify` for each predicate type and posts a summary table.
+
 ---
 
 ## Release Please
@@ -100,6 +109,14 @@ container attestation process driven by a **Release Please** PR lifecycle.
 
 ## Verifying attestations
 
+### Using the verification workflow
+
+Go to **Actions → Verify Release Attestations → Run workflow** and enter a
+release tag (e.g. `v0.2.1`).  The workflow resolves the image digest, verifies
+all four predicate types, and posts a summary table in the run's step summary.
+
+### Using the CLI
+
 After any workflow run, verify the image's attestations with the `gh` CLI:
 
 ```bash
@@ -111,6 +128,22 @@ gh attestation verify \
 
 The command verifies all stored attestations against Sigstore's public
 transparency log and exits non-zero if any verification fails.
+
+### Release 0.2.1 verification
+
+Release `v0.2.1` was verified on 2026-03-17.  All four attestations passed:
+
+| Attestation | Predicate Type | Origin | Status |
+|-------------|----------------|--------|--------|
+| Build Provenance (SLSA) | `https://slsa.dev/provenance/v1` | RC | ✅ PASSED |
+| Test Results | `https://example.com/test-results/v1` | RC | ✅ PASSED |
+| Release PR CI Summary | `https://example.com/release-pr-ci-summary/v1` | RC | ✅ PASSED |
+| Release Promotion | `https://example.com/release-promotion/v1` | Release | ✅ PASSED |
+
+Image digest: `sha256:eb6bd520879b09c48eb6895811e2bcd3ea1c99d5d939582da7ff897fd49a9fe0`
+
+Compliance evidence and attestation bundles are attached to the
+[v0.2.1 release](https://github.com/michaelmelody91/attestation-release-process/releases/tag/v0.2.1).
 
 ---
 
