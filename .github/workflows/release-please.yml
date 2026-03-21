@@ -394,3 +394,44 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Evidence report and attestation bundles uploaded to the GitHub Release." \
             >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 3 – Post-release Deployment
+  #
+  # Runs after the release evidence job completes successfully.
+  # This represents the actual deployment of the released artifact.
+  #
+  # For this POC the deployment step is a simple echo command.  Replace it
+  # with real deployment logic (e.g. kubectl set image, helm upgrade,
+  # ArgoCD app sync, AWS CDK deploy, Terraform apply, etc.).
+  # ───────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy release
+    needs: [release_please, release_evidence]
+    if: needs.release_please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy
+        run: |
+          TAG="${{ needs.release_please.outputs.tag_name }}"
+          IMAGE="ghcr.io/${{ github.repository }}/poc:${TAG}"
+          echo "🚀 Deploying release ${TAG}"
+          echo "Image: ${IMAGE}"
+          echo ""
+          echo "This is a POC deployment step."
+          echo "Replace this echo with real deployment logic, for example:"
+          echo "  kubectl set image deployment/my-app my-app=${IMAGE}"
+
+      - name: Step summary
+        run: |
+          TAG="${{ needs.release_please.outputs.tag_name }}"
+          echo "### 🚀 Deployment completed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Release | \`${TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Image | \`ghcr.io/${{ github.repository }}/poc:${TAG}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "> **Note:** Replace the deploy step with real deployment logic." \
+            >> "$GITHUB_STEP_SUMMARY"

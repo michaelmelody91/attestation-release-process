@@ -23,7 +23,11 @@ interoperability with the broader supply-chain security ecosystem.
    ├─ attest_build        – SLSA build-provenance attestation (signed, pushed to GHCR)
    ├─ attest_tests        – run tests → test-results attestation  (signed, pushed to GHCR)
    ├─ attest_pr_summary   – release PR CI summary attestation     (signed, pushed to GHCR)
-   └─ verify_and_comment  – verify all 3 attestations → post PR comment with digest
+   ├─ verify_and_comment  – verify all 3 attestations → post PR comment with digest
+   └─ deployment_gate     – target "pre-release" environment → wait for reviewer approval
+                               │ (reviewer approves in GitHub Environments UI)
+                               ▼
+                         PR is approved + auto-merge enabled
           │
           ▼ (Release Please PR is merged → release is cut)
  release-please.yml  release_evidence job
@@ -33,6 +37,10 @@ interoperability with the broader supply-chain security ecosystem.
    ├─ attest release promotion (in-toto Link predicate recording the re-tag)
    ├─ verify all 4 attestations (3 from RC carry over + 1 promotion)
    └─ upload compliance-evidence-*.md + attestation bundles to GitHub Release
+          │
+          ▼ (after evidence is attached)
+ release-please.yml  deploy job
+   └─ echo deployment command (replace with real deploy logic)
 ```
 
 ---
@@ -73,6 +81,7 @@ All predicates follow established in-toto / SLSA standards:
 |-----|------|------|
 | `release_please` | every push to main | Runs `googleapis/release-please-action@v4` in manifest mode |
 | `release_evidence` | only when a release is cut | Promotes RC image (`vX.Y.Z-rc` → `vX.Y.Z`, same digest – no rebuild), attests the promotion, verifies all 4 attestations, uploads evidence to GitHub Release |
+| `deploy` | only when a release is cut | POC deployment step (echo). Replace with real deployment logic. |
 
 ### `rc-attest-on-release-please-pr.yml`
 
@@ -89,6 +98,7 @@ All predicates follow established in-toto / SLSA standards:
 | `attest_tests` | `actions/attest@v2` – in-toto test-result predicate |
 | `attest_pr_summary` | `actions/attest@v2` – SCAI attribute report for CI summary |
 | `verify_and_comment` | Verify all attestations; post PR comment with digest + verify command |
+| `deployment_gate` | Target `pre-release` environment → pause for reviewer approval → approve PR + enable auto-merge |
 
 ### `verify-attestations.yml`
 
@@ -106,6 +116,52 @@ The workflow:
    promotion chain, and build provenance from the signed predicates
 5. **Generates a downloadable audit report** (Markdown) and uploads it as a
    workflow artifact alongside the attestation bundles
+
+---
+
+## Deployment Approval Gate
+
+The `deployment_gate` job in `rc-attest-on-release-please-pr.yml` introduces a
+**GitHub Environments approval gate** into the Release Please PR lifecycle.
+
+### How it works
+
+1. The RC attestations run and `verify_and_comment` posts the attestation report on the PR.
+2. `deployment_gate` targets the `pre-release` environment and **pauses**.
+   GitHub creates a Deployment and notifies the environment's required reviewers.
+3. A reviewer opens the workflow run (or the PR Deployments tab) and
+   **approves or rejects** the deployment.
+4. On **approval**: the job resumes, approves the PR via the GitHub API, and
+   enables auto-merge. The PR will merge once all required status checks pass.
+5. On **rejection**: the job fails, the PR is not approved, and the release is blocked.
+6. After the PR merges and the release is cut, the `deploy` job in
+   `release-please.yml` runs the final deployment step.
+
+### Setup
+
+1. **Create the `pre-release` GitHub Environment**
+   - Go to **Settings → Environments → New environment**
+   - Name it exactly **`pre-release`**
+   - Under **Deployment protection rules**, add **Required reviewers** (the
+     person or team who must approve before a release PR can be merged)
+   - Optionally set a **Wait timer** and restrict to the `main` branch
+
+2. **Enable auto-merge in repository settings** (optional but recommended)
+   - Go to **Settings → General → Pull Requests**
+   - Check **Allow auto-merge**
+
+3. **Branch protection** (recommended)
+   - If you require a minimum number of approvals, ensure
+     **"Allow GitHub Actions reviews to count towards required approval"**
+     is enabled, or use a dedicated PAT for the approval step (see note below).
+
+> **Note on PR approval token:**  The `deployment_gate` job uses `GITHUB_TOKEN`
+> (`github-actions[bot]`) to approve the PR.  Because the Release Please PR is
+> created by the `RELEASE_PLEASE_TOKEN` PAT (a different actor), the bot
+> approval is permitted.  If your branch protection rules require approvals
+> from humans only, substitute a second personal access token stored as a
+> repository secret and set `GH_TOKEN: ${{ secrets.APPROVAL_PAT }}` in the
+> `deployment_gate` job's `env` block.
 
 ---
 
@@ -192,3 +248,5 @@ crane digest ghcr.io/<owner>/attestation-release-process/poc:v0.2.1-rc
 | Different registry | Both workflows | `IMAGE_NAME` env var + login action |
 | Predicate types | Both workflows | `predicate-type:` inputs on `actions/attest` steps |
 | Promotion predicate type | `release-please.yml` | `release_evidence` → `Generate release-promotion predicate` |
+| Real deployment logic | `release-please.yml` | `deploy` → `Deploy` step |
+| Approval token (if humans-only reviews required) | `rc-attest-on-release-please-pr.yml` | `deployment_gate` → set `GH_TOKEN` to a PAT secret |
