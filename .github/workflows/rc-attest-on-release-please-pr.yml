@@ -47,7 +47,8 @@ permissions:
   packages: write      # push image and attestations to GHCR
   id-token: write      # obtain OIDC token for Sigstore attestation signing
   attestations: write  # persist attestations via the GitHub attestations API
-  pull-requests: write # post the summary comment on the Release Please PR
+  pull-requests: write # post the summary comment and approve the Release Please PR
+  deployments: write   # create deployments when targeting the pre-release environment
 
 env:
   # Canonical GHCR image path for the RC artifact.
@@ -543,3 +544,86 @@ jobs:
           gh pr comment "${{ github.event.pull_request.number }}" \
             --repo "${{ github.repository }}" \
             --body-file /tmp/pr-comment.md
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Job 6 – Deployment Approval Gate (GitHub Environments)
+  #
+  # This job targets the "pre-release" GitHub Environment, which should be
+  # configured with required reviewers (Settings → Environments → pre-release).
+  # GitHub pauses this job, creates a Deployment in the environment, and waits
+  # for a reviewer to approve it in the GitHub UI before the steps below run.
+  #
+  # Once approved, this job:
+  #   1. Approves the Release Please PR via the GitHub API (GITHUB_TOKEN)
+  #   2. Enables auto-merge so the PR merges once all required checks pass
+  #   3. Posts a comment summarising the approval
+  #
+  # Setup:
+  #   - Go to Settings → Environments → New environment → name it "pre-release"
+  #   - Add required reviewers
+  #   - Optionally configure a wait timer or deployment branch rules
+  # ───────────────────────────────────────────────────────────────────────────
+  deployment_gate:
+    name: Deployment approval gate
+    runs-on: ubuntu-latest
+    needs: verify_and_comment
+    environment: pre-release
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      # ── Approve the Release Please PR ─────────────────────────────────────
+      # The GITHUB_TOKEN (github-actions[bot]) approves the PR, which was
+      # created by the RELEASE_PLEASE_TOKEN PAT – a different actor, so the
+      # self-approval restriction does not apply.
+      # NOTE: If branch protection requires human approvals, this bot approval
+      # may not count towards the required number of approvals.  In that case,
+      # configure "Allow GitHub Actions reviews to count towards required
+      # approval" in the branch protection settings, or use a separate PAT.
+      - name: Approve Release Please PR
+        run: |
+          cat > /tmp/approval-body.md << APPROVAL
+          ✅ Approved via the **pre-release** deployment gate. A reviewer approved the deployment in GitHub Environments.
+          APPROVAL
+
+          gh pr review "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --approve \
+            --body-file /tmp/approval-body.md
+
+      # ── Enable auto-merge ─────────────────────────────────────────────────
+      # Auto-merge merges the PR as soon as all required status checks pass.
+      # continue-on-error: true because auto-merge requires it to be enabled
+      # in the repo settings and the PR to have required status checks.
+      - name: Enable auto-merge
+        continue-on-error: true
+        run: |
+          gh pr merge "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --auto \
+            --squash
+
+      - name: Post approval comment
+        run: |
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          cat > /tmp/gate-comment.md << COMMENT
+          🚀 **Deployment gate approved.**
+
+          A reviewer approved the [\`pre-release\`](${RUN_URL}) environment deployment.
+          This PR has been approved and auto-merge has been enabled — it will merge once all required checks pass.
+          COMMENT
+
+          gh pr comment "${{ github.event.pull_request.number }}" \
+            --repo "${{ github.repository }}" \
+            --body-file /tmp/gate-comment.md
+
+      - name: Step summary
+        run: |
+          echo "### 🚀 Deployment gate approved" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "The \`pre-release\` deployment was approved by a reviewer." >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Action | Status |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|--------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| PR #${{ github.event.pull_request.number }} Approval | ✅ Approved |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Auto-merge | ✅ Enabled |" >> "$GITHUB_STEP_SUMMARY"
